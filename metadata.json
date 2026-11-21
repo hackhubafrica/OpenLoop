@@ -1,0 +1,6 @@
+{
+  "name": "OpenLoop — Embedded Control & HIL Workbench",
+  "description": "Open-source (MIT/Apache-2.0) embedded control systems workbench for state-space modeling, deterministic fixed-step MIL/SIL simulation, C99 and no_std Rust code generation, and Hardware-in-the-Loop (HIL) framing verification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
