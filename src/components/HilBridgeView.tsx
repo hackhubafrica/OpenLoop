@@ -9,6 +9,7 @@ import {
 } from '../engine/hil';
 import { exportTextFile } from '../utils/exportBundle';
 import { HilLatencyChart } from './HilLatencyChart';
+import { HilSerialMonitorChart } from './HilSerialMonitorChart';
 
 interface SerialPortInfo {
   id: string;
@@ -50,8 +51,9 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
   const [bridgeStatusMsg, setBridgeStatusMsg] = useState<string | null>(null);
   const [inspectorTab, setInspectorTab] = useState<'frame' | 'esp32_cpp'>('frame');
   const [copiedCpp, setCopiedCpp] = useState(false);
+  const [telemetryWindow, setTelemetryWindow] = useState<32 | 64 | 96>(64);
   const [packets, setPackets] = useState<HilFramePacket[]>(() =>
-    buildHilFrameStream(model, trace, { jitterMs: 1.2, packetDropPct: 4, seed: 42 })
+    buildHilFrameStream(model, trace, { jitterMs: 1.2, packetDropPct: 4, seed: 42 }, 64)
   );
 
   const cobsActive = isHilCobsEnabled(model);
@@ -83,7 +85,7 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
     }
   };
 
-  const seqRef = useRef<number>(48);
+  const seqRef = useRef<number>(64);
   const sampleCursorRef = useRef<number>(0);
   const missesRef = useRef<number>(0);
 
@@ -109,11 +111,16 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
 
   // Re-initialize rolling HIL buffer when model, transport, or fault sliders reset
   useEffect(() => {
-    const initial = buildHilFrameStream(model, trace, {
-      jitterMs,
-      packetDropPct,
-      seed,
-    });
+    const initial = buildHilFrameStream(
+      model,
+      trace,
+      {
+        jitterMs,
+        packetDropPct,
+        seed,
+      },
+      96
+    );
     setPackets(initial);
     seqRef.current = initial.length;
     sampleCursorRef.current = 0;
@@ -123,12 +130,16 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
     }
   }, [model, trace, jitterMs, packetDropPct, seed]);
 
+  const handleClearTelemetry = () => {
+    setPackets([]);
+  };
+
   const pushNextFrame = () => {
     if (trace.samples.length === 0) return;
     const nextSeq = seqRef.current + 1;
     seqRef.current = nextSeq;
     const idx = sampleCursorRef.current % trace.samples.length;
-    sampleCursorRef.current = idx + Math.max(1, Math.floor(trace.samples.length / 48));
+    sampleCursorRef.current = idx + Math.max(1, Math.floor(trace.samples.length / 64));
 
     const { packet, nextConsecutiveMisses } = createHilPacket(
       model,
@@ -140,12 +151,12 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
     missesRef.current = nextConsecutiveMisses;
 
     setPackets((prev) => {
-      const next = [...prev.slice(-47), packet];
+      const next = [...prev.slice(-95), packet];
       return next;
     });
     setSelectedSeq((prevSel) => {
       // Keep selection locked if user clicked an older packet still in buffer; otherwise follow live head
-      return prevSel === nextSeq - 1 ? nextSeq : prevSel;
+      return prevSel === nextSeq - 1 || prevSel === 0 ? nextSeq : prevSel;
     });
 
     if (bridgeMode === 'bridge') {
@@ -452,13 +463,28 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
 
       {/* Real-Time D3.js Latency Visualization */}
       <HilLatencyChart
-        packets={packets}
+        packets={packets.slice(-telemetryWindow)}
         budgetMs={budgetMs}
         selectedSeq={selectedPacket?.seq ?? 1}
         onSelectSeq={(seq) => {
           setIsStreaming(false);
           setSelectedSeq(seq);
         }}
+        isStreaming={isStreaming}
+      />
+
+      {/* ESP32 Real-Time Serial Monitor (Multi-Channel Strip Chart) */}
+      <HilSerialMonitorChart
+        model={model}
+        packets={packets}
+        selectedSeq={selectedPacket?.seq ?? 1}
+        onSelectSeq={(seq) => {
+          setIsStreaming(false);
+          setSelectedSeq(seq);
+        }}
+        onClearBuffer={handleClearTelemetry}
+        windowSize={telemetryWindow}
+        onChangeWindowSize={setTelemetryWindow}
         isStreaming={isStreaming}
       />
 

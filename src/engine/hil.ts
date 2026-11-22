@@ -164,14 +164,16 @@ export function createHilPacket(
 export function buildHilFrameStream(
   model: ControlModel,
   trace: SimulationTrace,
-  hilSim: HilSimulationConfig
+  hilSim: HilSimulationConfig,
+  maxPackets: number = 48
 ): HilFramePacket[] {
   const packets: HilFramePacket[] = [];
-  const sampleCount = Math.min(48, trace.samples.length);
-  const step = Math.max(1, Math.floor(trace.samples.length / sampleCount));
+  const cap = Math.max(8, Math.min(240, Math.round(maxPackets)));
+  const sampleCount = Math.min(cap, trace.samples.length);
+  const step = Math.max(1, Math.floor(trace.samples.length / Math.max(1, sampleCount)));
   let consecutiveMisses = 0;
 
-  for (let idx = 0, seq = 1; idx < trace.samples.length && packets.length < 48; idx += step, seq++) {
+  for (let idx = 0, seq = 1; idx < trace.samples.length && packets.length < cap; idx += step, seq++) {
     const res = createHilPacket(
       model,
       trace.samples[idx],
@@ -184,6 +186,102 @@ export function buildHilFrameStream(
   }
 
   return packets;
+}
+
+export interface TelemetryChannelMeta {
+  id: 'ref' | 'y0' | 'y1' | 'uCmd';
+  shortLabel: string;
+  label: string;
+  unit: string;
+  color: string;
+  stepped?: boolean;
+}
+
+export interface TelemetryStripSample {
+  seq: number;
+  tickUs: number;
+  simTime: number;
+  ref: number;
+  y0: number;
+  y1: number;
+  uCmd: number;
+  rawUCmd: number;
+  dropped: boolean;
+  deadlineMissed: boolean;
+  watchdogState: HilFramePacket['watchdogState'];
+}
+
+export function getHilTelemetryChannels(model: ControlModel): TelemetryChannelMeta[] {
+  const rx0 = model.hil.rxChannels[0] ?? 'y0';
+  const rx1 = model.hil.rxChannels[1] ?? 'y1';
+  const tx0 = model.hil.txChannels[0] ?? 'u_cmd';
+  const outIdx = Math.min(
+    Math.max(0, model.pid.targetOutputIndex),
+    Math.max(0, model.plant.outputUnits.length - 1)
+  );
+  const refUnit = model.plant.outputUnits[outIdx] ?? '';
+  const y0Unit = model.plant.outputUnits[0] ?? '';
+  const y1Unit = model.plant.outputUnits[1] ?? '';
+  const uUnit = model.plant.inputUnit ?? '';
+
+  return [
+    {
+      id: 'ref',
+      shortLabel: 'CH0 · ref',
+      label: 'Setpoint Ref',
+      unit: refUnit,
+      color: '#E2E8F0',
+    },
+    {
+      id: 'y0',
+      shortLabel: `CH1 · ${rx0}`,
+      label: model.plant.outputNames[0] ?? rx0,
+      unit: y0Unit,
+      color: '#06B6D4',
+    },
+    {
+      id: 'y1',
+      shortLabel: `CH2 · ${rx1}`,
+      label: model.plant.outputNames[1] ?? rx1,
+      unit: y1Unit,
+      color: '#10B981',
+    },
+    {
+      id: 'uCmd',
+      shortLabel: `CH3 · ${tx0}`,
+      label: model.plant.inputName ?? tx0,
+      unit: uUnit,
+      color: '#F59E0B',
+      stepped: true,
+    },
+  ];
+}
+
+export function extractTelemetryStripSeries(
+  model: ControlModel,
+  packets: HilFramePacket[]
+): TelemetryStripSample[] {
+  return packets.map((pkt) => {
+    const ref = pkt.payloadFloats[0] ?? 0;
+    const y0 = pkt.payloadFloats[1] ?? 0;
+    const y1 = pkt.payloadFloats[2] ?? 0;
+    const rawUCmd = pkt.payloadFloats[3] ?? 0;
+    const uCmd =
+      pkt.watchdogState === 'SAFE_CLAMP' ? model.hil.safeClampValue : rawUCmd;
+    return {
+      seq: pkt.seq,
+      tickUs: pkt.tickUs,
+      simTime: pkt.simTime,
+      ref,
+      y0,
+      y1,
+      uCmd,
+      rawUCmd,
+      dropped: pkt.dropped,
+      deadlineMissed: pkt.deadlineMissed,
+      watchdogState: pkt.watchdogState,
+    };
+  });
 }
 
 export function generateEsp32HilDeserializationCpp(

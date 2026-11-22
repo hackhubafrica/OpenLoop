@@ -4,6 +4,7 @@ import {
   Check,
   CheckCircle2,
   Copy,
+  Cpu,
   Download,
   FileCode2,
   FileDown,
@@ -11,6 +12,7 @@ import {
   RotateCcw,
   Save,
   SlidersHorizontal,
+  Sparkles,
   Upload,
 } from 'lucide-react';
 import { ControlModel, PresetId, ValidationReport } from '../types/control';
@@ -31,6 +33,12 @@ import {
   parseCoefficientList,
   transferFunctionToStateSpace,
 } from '../engine/transferFunction';
+import {
+  autoTunePidGains,
+  getRecommendedAutoTuneDefaults,
+  PidAutoTuneResult,
+} from '../engine/pidAutoTune';
+import { ESP32_BOARD_SPECS, Esp32BoardEnv } from '../engine/esp32Codegen';
 import { BodePlot } from './BodePlot';
 import { NyquistPlot } from './NyquistPlot';
 import { PoleZeroPlot } from './PoleZeroPlot';
@@ -118,9 +126,28 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
   const [controllerFocusTick, setControllerFocusTick] = useState(0);
   const [pzLoopMode, setPzLoopMode] = useState<'open' | 'closed'>('open');
   const [baselinePid, setBaselinePid] = useState(() => ({ ...model.pid }));
+  const initialTuneDefaults = useMemo(
+    () => getRecommendedAutoTuneDefaults(model),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+  const [autoTuneBoard, setAutoTuneBoard] = useState<Esp32BoardEnv>('esp32dev');
+  const [targetRiseTimeSec, setTargetRiseTimeSec] = useState<number>(
+    initialTuneDefaults.targetRiseTimeSec
+  );
+  const [maxOvershootPct, setMaxOvershootPct] = useState<number>(
+    initialTuneDefaults.maxOvershootPct
+  );
+  const [autoTuneResult, setAutoTuneResult] = useState<PidAutoTuneResult | null>(
+    null
+  );
 
   useEffect(() => {
     setBaselinePid({ ...model.pid });
+    const nextDefaults = getRecommendedAutoTuneDefaults(model);
+    setTargetRiseTimeSec(nextDefaults.targetRiseTimeSec);
+    setMaxOvershootPct(nextDefaults.maxOvershootPct);
+    setAutoTuneResult(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model.id]);
 
@@ -202,7 +229,25 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
       ...model,
       pid: restoredPid,
     });
+    setAutoTuneResult(null);
     revealPoleZeroClosedLoop();
+  };
+
+  const handleRunPidAutoTune = () => {
+    const result = autoTunePidGains(model, {
+      targetRiseTimeSec,
+      maxOvershootPct,
+      esp32Board: autoTuneBoard,
+    });
+    setAutoTuneResult(result);
+  };
+
+  const handleApplySuggestedPid = () => {
+    if (!autoTuneResult) return;
+    handlePidUpdate({
+      enabled: true,
+      ...autoTuneResult.recommendedPid,
+    });
   };
 
   const handleComputeRootLocus = () => {
@@ -844,6 +889,214 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
                   />
                 </div>
               </div>
+            </div>
+
+            {/* ESP32 PID Auto-Tuner (Rise Time & Overshoot Constraints) */}
+            <div className="p-2.5 rounded border border-slate-800 bg-[#07090E] space-y-2.5">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-[11px] font-semibold text-slate-200 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+                    ESP32 PID Auto-Tuner
+                  </div>
+                  <div className="text-[10px] font-mono text-slate-400 tabular-nums">
+                    {model.id.startsWith('esp32')
+                      ? `${model.name.split('(')[0].trim()} · ${Math.round(1 / Math.max(1e-5, model.baseDt))} Hz`
+                      : `Target @ ${Math.round(1 / Math.max(1e-5, model.baseDt))} Hz`}
+                  </div>
+                </div>
+                <div className="flex items-center gap-1 text-[10px] font-mono text-cyan-300 shrink-0">
+                  <Cpu className="w-3 h-3" />
+                  <select
+                    aria-label="ESP32 target model for PID auto-tuner"
+                    value={autoTuneBoard}
+                    onChange={(e) => {
+                      setAutoTuneBoard(e.target.value as Esp32BoardEnv);
+                      setAutoTuneResult(null);
+                    }}
+                    className="bg-[#0B0E17] border border-slate-800 rounded px-1.5 py-0.5 text-[10px] font-mono text-slate-200 focus:outline-none focus:border-cyan-400 cursor-pointer"
+                  >
+                    {(Object.keys(ESP32_BOARD_SPECS) as Esp32BoardEnv[]).map((envKey) => (
+                      <option key={envKey} value={envKey}>
+                        {envKey}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="p-2 rounded border border-slate-800/80 bg-[#0B0E17] space-y-1">
+                  <div className="flex items-center justify-between gap-1">
+                    <label
+                      htmlFor="schema-autotune-tr"
+                      className="text-[10px] font-mono text-slate-400"
+                    >
+                      Rise Time t_r (s)
+                    </label>
+                    <input
+                      id="schema-autotune-tr"
+                      type="number"
+                      min={Number((model.baseDt * 2.5).toPrecision(2))}
+                      max={Math.max(10, model.duration)}
+                      step={model.baseDt < 0.005 ? 0.001 : 0.05}
+                      value={targetRiseTimeSec}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        if (Number.isFinite(val) && val > 0) {
+                          setTargetRiseTimeSec(val);
+                        }
+                      }}
+                      className="w-16 bg-[#07090E] border border-slate-800 rounded px-1.5 py-0.5 text-[10.5px] font-mono tabular-nums text-right text-cyan-300 focus:outline-none focus:border-cyan-400"
+                    />
+                  </div>
+                  <input
+                    aria-label="Target rise time slider"
+                    type="range"
+                    min={Number((model.baseDt * 2.5).toPrecision(2))}
+                    max={Math.max(0.1, Number((model.duration * 0.5).toFixed(3)))}
+                    step={model.baseDt < 0.005 ? 0.0005 : 0.02}
+                    value={Math.min(
+                      Math.max(0.1, Number((model.duration * 0.5).toFixed(3))),
+                      targetRiseTimeSec
+                    )}
+                    onChange={(e) => setTargetRiseTimeSec(Number(e.target.value))}
+                    className="w-full h-1 bg-slate-800 rounded accent-cyan-400 cursor-pointer"
+                  />
+                </div>
+
+                <div className="p-2 rounded border border-slate-800/80 bg-[#0B0E17] space-y-1">
+                  <div className="flex items-center justify-between gap-1">
+                    <label
+                      htmlFor="schema-autotune-os"
+                      className="text-[10px] font-mono text-slate-400"
+                    >
+                      Max Overshoot (%)
+                    </label>
+                    <input
+                      id="schema-autotune-os"
+                      type="number"
+                      min={0}
+                      max={45}
+                      step={1}
+                      value={maxOvershootPct}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        if (Number.isFinite(val) && val >= 0 && val <= 50) {
+                          setMaxOvershootPct(val);
+                        }
+                      }}
+                      className="w-14 bg-[#07090E] border border-slate-800 rounded px-1.5 py-0.5 text-[10.5px] font-mono tabular-nums text-right text-amber-300 focus:outline-none focus:border-cyan-400"
+                    />
+                  </div>
+                  <input
+                    aria-label="Maximum overshoot percentage slider"
+                    type="range"
+                    min={0}
+                    max={35}
+                    step={1}
+                    value={Math.min(35, maxOvershootPct)}
+                    onChange={(e) => setMaxOvershootPct(Number(e.target.value))}
+                    className="w-full h-1 bg-slate-800 rounded accent-amber-400 cursor-pointer"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleRunPidAutoTune}
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 py-1.5 px-2.5 text-[11px] font-mono font-medium rounded border border-cyan-500/50 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+                  Suggest Optimal PID
+                </button>
+                {autoTuneResult && (
+                  <button
+                    type="button"
+                    onClick={handleApplySuggestedPid}
+                    className="inline-flex items-center justify-center gap-1 py-1.5 px-2.5 text-[11px] font-mono font-medium rounded border border-emerald-500/50 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    Apply Gains
+                  </button>
+                )}
+              </div>
+
+              {autoTuneResult && (
+                <div className="p-2 rounded border border-cyan-500/30 bg-[#0B0E17] space-y-1.5 text-[10.5px] font-mono tabular-nums">
+                  <div className="flex items-center justify-between gap-2">
+                    <span
+                      className={
+                        autoTuneResult.meetsConstraints
+                          ? 'text-emerald-400'
+                          : 'text-amber-300'
+                      }
+                    >
+                      {autoTuneResult.meetsConstraints
+                        ? '● Constraints Met'
+                        : '▲ Closest Stable Trade-off'}
+                    </span>
+                    <span className="text-slate-400">
+                      {autoTuneResult.iterationsEvaluated} evals
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-1.5 text-center">
+                    <div className="p-1 rounded bg-[#07090E] border border-slate-800/80">
+                      <div className="text-[9.5px] text-slate-500">Kp</div>
+                      <div className="text-cyan-300 font-semibold">
+                        {autoTuneResult.recommendedPid.kp}
+                      </div>
+                    </div>
+                    <div className="p-1 rounded bg-[#07090E] border border-slate-800/80">
+                      <div className="text-[9.5px] text-slate-500">Ki</div>
+                      <div className="text-emerald-300 font-semibold">
+                        {autoTuneResult.recommendedPid.ki}
+                      </div>
+                    </div>
+                    <div className="p-1 rounded bg-[#07090E] border border-slate-800/80">
+                      <div className="text-[9.5px] text-slate-500">Kd</div>
+                      <div className="text-violet-300 font-semibold">
+                        {autoTuneResult.recommendedPid.kd}
+                      </div>
+                    </div>
+                    <div className="p-1 rounded bg-[#07090E] border border-slate-800/80">
+                      <div className="text-[9.5px] text-slate-500">Filter N</div>
+                      <div className="text-slate-200 font-semibold">
+                        {autoTuneResult.recommendedPid.nFilter}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400 pt-0.5">
+                    <span>
+                      Pred t_r:{' '}
+                      <span className="text-slate-200">
+                        {autoTuneResult.achievedRiseTimeSec !== null
+                          ? `${autoTuneResult.achievedRiseTimeSec.toFixed(3)}s`
+                          : '—'}
+                      </span>
+                    </span>
+                    <span>
+                      OS:{' '}
+                      <span className="text-slate-200">
+                        {autoTuneResult.achievedOvershootPct !== null
+                          ? `${autoTuneResult.achievedOvershootPct.toFixed(1)}%`
+                          : '—'}
+                      </span>
+                    </span>
+                    <span>
+                      PM:{' '}
+                      <span className="text-slate-200">
+                        {autoTuneResult.phaseMarginDeg !== null
+                          ? `${autoTuneResult.phaseMarginDeg.toFixed(1)}°`
+                          : '—'}
+                      </span>
+                    </span>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Live Pole-Zero Shift Feedback Bar */}

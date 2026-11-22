@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { PRESET_MODELS } from '../../data/presets';
+import { getPlantTemplateById } from '../../data/plantTemplates';
 import { discretizeStateSpace } from '../math';
 import { generateEmbeddedCode } from '../codegen';
 import { runSimulation } from '../simulator';
 import {
+  buildHilFrameStream,
   cobsDecode,
   cobsEncode,
   createHilPacket,
+  extractTelemetryStripSeries,
   generateEsp32HilDeserializationCpp,
+  getHilTelemetryChannels,
   isHilCobsEnabled,
 } from '../hil';
 
@@ -80,5 +84,37 @@ describe('HIL COBS Framing & ESP32 C++ Deserialization Boilerplate', () => {
     expect(rawCpp).toContain('byte == 0xAAU');
     expect(rawCpp).toContain('hil_closed_loop_raw_tick');
     expect(rawCpp).toContain('ctrl_step(ctrl, &in, ctrl_out)');
+  });
+
+  it('formats incoming ESP32 serial packets into multi-channel strip telemetry and enforces SAFE_CLAMP values', () => {
+    const usModel = getPlantTemplateById('esp32_ultrasonic_hold')!.model;
+    const trace = runSimulation(usModel);
+
+    const channels = getHilTelemetryChannels(usModel);
+    expect(channels.map((c) => c.id)).toEqual(['ref', 'y0', 'y1', 'uCmd']);
+    expect(channels[1].shortLabel).toContain('dist_m');
+    expect(channels[3].shortLabel).toContain('pwm_led_pct');
+
+    const packets = buildHilFrameStream(
+      usModel,
+      trace,
+      { jitterMs: 2.5, packetDropPct: 20, seed: 19 },
+      64
+    );
+    expect(packets.length).toBeGreaterThan(32);
+
+    const nominal = packets[0];
+    const safeClamped = {
+      ...packets[1],
+      watchdogState: 'SAFE_CLAMP' as const,
+      payloadFloats: [0.25, 0.24, -0.02, 45.0],
+    };
+
+    const series = extractTelemetryStripSeries(usModel, [nominal, safeClamped]);
+    expect(series).toHaveLength(2);
+    expect(series[1].rawUCmd).toBe(45.0);
+    expect(series[1].uCmd).toBe(usModel.hil.safeClampValue);
+    expect(series[1].ref).toBe(0.25);
+    expect(series[1].y0).toBe(0.24);
   });
 });
