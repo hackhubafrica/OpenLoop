@@ -79,6 +79,7 @@ export interface StepRefConfig {
 
 export interface HilConfig {
   transport: 'uart_cobs' | 'socketcan' | 'udp';
+  cobsEnabled?: boolean;
   baudOrRate: string;
   watchdogMissLimit: number;
   safeClampValue: number;

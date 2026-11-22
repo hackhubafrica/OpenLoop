@@ -5,6 +5,7 @@ import { computeBodeAnalysis } from '../bode';
 import { runSimulation } from '../simulator';
 import {
   analyzeSystemStability,
+  computeImpulseResponse,
   computeMatrixEigenvalues,
   computePidCompensatorZeros,
   computePoleZeroStabilitySummary,
@@ -383,5 +384,123 @@ describe('Eigenvalue Solver & Continuous/Discrete Stability Analysis', () => {
       lowAnalysis.closedLoopPoles[0].re,
       2
     );
+  });
+
+  it('computes open-loop analytical 2nd-order impulse response, closed-loop decay, and RHP divergence', () => {
+    // G(s) = 16 / (s^2 + 4s + 16): wn = 4, zeta = 0.5, wd = sqrt(12)
+    // Analytical h(t) = (16 / wd) * exp(-2t) * sin(wd * t)
+    const { model: secondOrder } = applyTransferFunctionToModel(
+      PRESET_MODELS.dcmotor,
+      [16],
+      [1, 4, 16],
+      'Impulse 2nd Order'
+    );
+    const openImp = computeImpulseResponse(secondOrder, 'open', 0, 0, 3.0, 150);
+    expect(openImp.divergent).toBe(false);
+    expect(openImp.points.length).toBeGreaterThan(100);
+    expect(openImp.initialValue).toBeCloseTo(0, 8);
+
+    const wd = Math.sqrt(12);
+    const midPt = openImp.points.find((p) => p.t >= 0.4 && p.t <= 0.5)!;
+    const expectedH = (16 / wd) * Math.exp(-2 * midPt.t) * Math.sin(wd * midPt.t);
+    expect(midPt.h).toBeCloseTo(expectedH, 3);
+    expect(openImp.l2Energy).toBeGreaterThan(1.0);
+    expect(openImp.settlingTimeSec).not.toBeNull();
+
+    // Closed-loop DC Motor impulse decays to zero cleanly
+    const dcClosedImp = computeImpulseResponse(
+      PRESET_MODELS.dcmotor,
+      'closed',
+      0,
+      0,
+      PRESET_MODELS.dcmotor.duration,
+      200
+    );
+    expect(dcClosedImp.divergent).toBe(false);
+    expect(Math.abs(dcClosedImp.points[dcClosedImp.points.length - 1].h)).toBeLessThan(0.05);
+
+    // Open-loop Inverted Pendulum is unstable -> divergent = true
+    const pendOpenImp = computeImpulseResponse(PRESET_MODELS.pendulum, 'open', 1, 0, 2.0, 100);
+    expect(pendOpenImp.divergent).toBe(true);
+  });
+
+  it('computes 10-90% rise time, settling tolerance band, and closed-loop step transient metrics', () => {
+    // 1st-order system G(s) = 1 / (s + 2): tau = 0.5s, y_ss = 0.5
+    // Exact rise time t_r = tau * ln(9) ~= 1.0986s, settling time (2%) = tau * ln(50) ~= 1.9560s
+    const { model: firstOrder } = applyTransferFunctionToModel(
+      PRESET_MODELS.dcmotor,
+      [1],
+      [1, 2],
+      'First Order Lag'
+    );
+    const openStep = computeTransferFunctionStepResponse(
+      firstOrder,
+      'open',
+      0,
+      0,
+      3.5,
+      240
+    );
+    expect(openStep.divergent).toBe(false);
+    expect(openStep.dcSteadyState).toBeCloseTo(0.5, 6);
+    expect(openStep.y10).toBeCloseTo(0.05, 6);
+    expect(openStep.y90).toBeCloseTo(0.45, 6);
+    expect(openStep.riseTimeSec).not.toBeNull();
+    expect(openStep.riseTimeSec!).toBeCloseTo(0.5 * Math.log(9), 2);
+    expect(openStep.settlingTimeSec).not.toBeNull();
+    expect(openStep.settlingTimeSec!).toBeCloseTo(0.5 * Math.log(50), 1);
+    expect(openStep.settlingBandLow).toBeCloseTo(0.49, 4);
+    expect(openStep.settlingBandHigh).toBeCloseTo(0.51, 4);
+
+    // Closed-loop DC Motor tracks unit step cleanly with rise and settling metrics
+    const dcClosedStep = computeTransferFunctionStepResponse(
+      PRESET_MODELS.dcmotor,
+      'closed',
+      0,
+      0,
+      PRESET_MODELS.dcmotor.duration,
+      240
+    );
+    expect(dcClosedStep.divergent).toBe(false);
+    expect(dcClosedStep.dcSteadyState).toBeCloseTo(1.0, 4);
+    expect(dcClosedStep.riseTimeSec).not.toBeNull();
+    expect(dcClosedStep.riseTimeSec!).toBeGreaterThan(0);
+    expect(dcClosedStep.settlingTimeSec).not.toBeNull();
+  });
+
+  it('computes s-plane stability margin heatmap highlighting stable time-constant and controller gain regions', async () => {
+    const { computeSPlaneStabilityHeatmap } = await import('../stability');
+    const heatmap = computeSPlaneStabilityHeatmap(
+      PRESET_MODELS.dcmotor,
+      [-20, 4],
+      [-15, 15],
+      {
+        scope: 'closed',
+        gainScale: 1.0,
+        maxTimeConstantSec: 0.5, // sigma_threshold = -2.0
+        minDampingRatio: 0.2,
+        cols: 20,
+        rows: 12,
+      }
+    );
+
+    expect(heatmap.cells).toHaveLength(240);
+    expect(heatmap.sigmaThreshold).toBeCloseTo(-2.0, 8);
+    expect(heatmap.activeSystemStable).toBe(true);
+    expect(heatmap.stableGainRange.min).not.toBeNull();
+    expect(heatmap.stableGainRange.max).not.toBeNull();
+    expect(heatmap.stableGainRange.max!).toBeGreaterThanOrEqual(1.0);
+
+    // Every cell in RHP (re > 0) must be outside stable region with negative score
+    const rhpCells = heatmap.cells.filter((c) => c.re > 0);
+    expect(rhpCells.length).toBeGreaterThan(0);
+    expect(rhpCells.every((c) => !c.inStableRegion && c.marginScore < 0)).toBe(true);
+
+    // Deep LHP cells well inside damping cone and faster than tau_max must be inside stable region
+    const deepLhpStable = heatmap.cells.filter(
+      (c) => c.re <= -4.0 && Math.abs(c.im) <= 2.0
+    );
+    expect(deepLhpStable.length).toBeGreaterThan(0);
+    expect(deepLhpStable.every((c) => c.inStableRegion && c.marginScore > 0)).toBe(true);
   });
 });

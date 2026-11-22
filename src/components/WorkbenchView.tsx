@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Play,
   Pause,
@@ -11,6 +11,7 @@ import {
   ChevronRight,
   Plus,
   Minus,
+  TrendingUp,
 } from 'lucide-react';
 import {
   ControlModel,
@@ -35,7 +36,10 @@ import {
 import { PLANT_TEMPLATES } from '../data/plantTemplates';
 import { BlockDiagram } from './BlockDiagram';
 import { PlantSchematic } from './PlantSchematic';
+import { StateSpaceTopologyViewer } from './StateSpaceTopologyViewer';
 import { Oscilloscope } from './Oscilloscope';
+import { ImpulseOverlayPanel } from './ImpulseOverlayPanel';
+import { FrequencyResponsePanel } from './FrequencyResponsePanel';
 import { UnitConverterPanel } from './UnitConverterPanel';
 import {
   applyTransferFunctionToModel,
@@ -100,6 +104,21 @@ export const WorkbenchView: React.FC<WorkbenchViewProps> = ({
   const [tfDenText, setTfDenText] = useState('1, 4, 16');
   const [tfLabel, setTfLabel] = useState('');
   const [tfError, setTfError] = useState<string | null>(null);
+  const [diagramTabOverride, setDiagramTabOverride] = useState<
+    'pipeline' | 'topology' | null
+  >(null);
+
+  const isImportedOrCustom =
+    Boolean(model.isCustomModel) ||
+    (model.id !== 'pendulum' && model.id !== 'dcmotor' && model.id !== 'buck');
+
+  useEffect(() => {
+    setDiagramTabOverride(null);
+  }, [model.id, isImportedOrCustom]);
+
+  const activeDiagramTab: 'pipeline' | 'topology' =
+    diagramTabOverride ?? (isImportedOrCustom ? 'topology' : 'pipeline');
+  const [showStepResponse, setShowStepResponse] = useState(false);
 
   const handleSelectBlock = (blockId: string) => {
     setSelectedBlockId(blockId);
@@ -337,6 +356,20 @@ export const WorkbenchView: React.FC<WorkbenchViewProps> = ({
           >
             <Zap className="w-3.5 h-3.5" />
             Inject Impulse
+          </button>
+
+          <button
+            type="button"
+            aria-pressed={showStepResponse}
+            onClick={() => setShowStepResponse((v) => !v)}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border rounded transition-colors cursor-pointer whitespace-nowrap ${
+              showStepResponse
+                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                : 'bg-[#07090E] hover:bg-slate-800 text-slate-200 border-slate-700'
+            }`}
+          >
+            <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+            Step Response
           </button>
 
           <button
@@ -1662,16 +1695,67 @@ export const WorkbenchView: React.FC<WorkbenchViewProps> = ({
 
         {/* Main Viewport Stage */}
         <main className="flex-1 flex flex-col min-w-0 min-h-0 bg-[#07090E] overflow-y-auto">
-          {/* Upper Stage: Block Diagram + Synchronized 2D Plant Schematic */}
-          <div className="flex-1 grid grid-cols-1 xl:grid-cols-12 min-h-[260px]">
-            <div className="xl:col-span-8 border-b xl:border-b-0 xl:border-r border-slate-800 bg-[#0B0E17] min-w-0">
-              <BlockDiagram
-                model={model}
-                validation={validation}
-                selectedBlockId={selectedBlockId}
-                onSelectBlock={handleSelectBlock}
-                isPlaying={isPlaying}
-              />
+          {/* Upper Stage: Model Diagram (Pipeline / Dynamic State-Space Topology) + Synchronized 2D / Vector Stage */}
+          <div className="flex-1 grid grid-cols-1 xl:grid-cols-12 min-h-[300px]">
+            <div className="xl:col-span-8 border-b xl:border-b-0 xl:border-r border-slate-800 bg-[#0B0E17] min-w-0 flex flex-col">
+              <div className="flex items-center justify-between px-3 py-1.5 border-b border-slate-800/80 bg-[#0F141E]/60">
+                <div
+                  className="flex items-center gap-1"
+                  role="tablist"
+                  aria-label="Model diagram view mode"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeDiagramTab === 'topology'}
+                    onClick={() => setDiagramTabOverride('topology')}
+                    className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeDiagramTab === 'topology'
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                        : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                    }`}
+                  >
+                    State-Space Model GUI
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeDiagramTab === 'pipeline'}
+                    onClick={() => setDiagramTabOverride('pipeline')}
+                    className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeDiagramTab === 'pipeline'
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                        : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                    }`}
+                  >
+                    Control Pipeline
+                  </button>
+                </div>
+                <span className="text-[11px] font-mono text-slate-400 truncate pl-2">
+                  {isImportedOrCustom
+                    ? 'Custom / Imported Plant Topology'
+                    : 'Built-In Benchmark'}
+                </span>
+              </div>
+
+              <div className="flex-1 min-h-0">
+                {activeDiagramTab === 'topology' ? (
+                  <StateSpaceTopologyViewer
+                    model={model}
+                    sample={currentSample}
+                    isPlaying={isPlaying}
+                    onInspectTarget={(group) => setOpenGroup(group)}
+                  />
+                ) : (
+                  <BlockDiagram
+                    model={model}
+                    validation={validation}
+                    selectedBlockId={selectedBlockId}
+                    onSelectBlock={handleSelectBlock}
+                    isPlaying={isPlaying}
+                  />
+                )}
+              </div>
             </div>
             <div className="xl:col-span-4 bg-[#0B0E17] min-w-0">
               <PlantSchematic model={model} sample={currentSample} />
@@ -1732,6 +1816,8 @@ export const WorkbenchView: React.FC<WorkbenchViewProps> = ({
             trace={trace}
             activeIndex={activeIndex}
             onScrubIndex={onScrubIndex}
+            showStepResponse={showStepResponse}
+            onToggleStepResponse={() => setShowStepResponse((v) => !v)}
           />
 
           {/* Performance Statistics Card */}
@@ -1811,6 +1897,17 @@ export const WorkbenchView: React.FC<WorkbenchViewProps> = ({
               </section>
             );
           })()}
+
+          {/* Time-Domain Impulse Response vs Simulated Output Overlay */}
+          <ImpulseOverlayPanel
+            model={model}
+            trace={trace}
+            activeIndex={activeIndex}
+            onScrubIndex={onScrubIndex}
+          />
+
+          {/* Frequency-Domain Bode Magnitude & Phase Diagrams (D3.js) */}
+          <FrequencyResponsePanel model={model} />
         </main>
       </div>
     </div>

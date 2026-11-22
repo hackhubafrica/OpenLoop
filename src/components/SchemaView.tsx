@@ -32,8 +32,12 @@ import {
   transferFunctionToStateSpace,
 } from '../engine/transferFunction';
 import { BodePlot } from './BodePlot';
+import { NyquistPlot } from './NyquistPlot';
 import { PoleZeroPlot } from './PoleZeroPlot';
+import { SDomainSensitivityPlot } from './SDomainSensitivityPlot';
 import { StepResponseThumbnail } from './StepResponseThumbnail';
+import { MarkdownGuideView } from './MarkdownGuideView';
+import { TEMPLATING_ENGINE_DOCS_MD } from '../data/templatingDocs';
 import { exportSystemAnalysisPdf } from '../utils/exportPdfReport';
 
 interface SchemaViewProps {
@@ -93,8 +97,10 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
   const isInternalTfUpdateRef = useRef(false);
   const [text, setText] = useState(() => serializeModelToToml(model));
   const [parseError, setParseError] = useState<string | null>(null);
-  const [paneMode, setPaneMode] = useState<'split' | 'ir' | 'analysis'>('split');
-  const [analysisTab, setAnalysisTab] = useState<'bode' | 'pz' | 'combined'>('combined');
+  const [paneMode, setPaneMode] = useState<'split' | 'ir' | 'analysis' | 'docs'>('split');
+  const [analysisTab, setAnalysisTab] = useState<
+    'bode' | 'nyquist' | 'pz' | 'sensitivity' | 'combined'
+  >('combined');
 
   const initialTf = useMemo(
     () => stateSpaceToTransferFunction(model.plant, model.pid.targetOutputIndex, 0),
@@ -166,7 +172,7 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
   const revealPoleZeroClosedLoop = () => {
     setControllerFocusTick((t) => t + 1);
     setStabilityScope('closed');
-    if (paneMode === 'ir') setPaneMode('split');
+    if (paneMode === 'ir' || paneMode === 'docs') setPaneMode('split');
     if (analysisTab === 'bode') setAnalysisTab('combined');
   };
 
@@ -201,7 +207,7 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
 
   const handleComputeRootLocus = () => {
     setShowRootLocus(true);
-    if (paneMode === 'ir') setPaneMode('split');
+    if (paneMode === 'ir' || paneMode === 'docs') setPaneMode('split');
     if (analysisTab === 'bode') setAnalysisTab('combined');
   };
 
@@ -350,17 +356,24 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <div className="flex items-center gap-0.5 p-0.5 bg-[#07090E] border border-slate-800 rounded">
+            <div
+              className="flex items-center gap-0.5 p-0.5 bg-[#07090E] border border-slate-800 rounded"
+              role="tablist"
+              aria-label="Schema workspace mode"
+            >
               {(
                 [
                   { id: 'split', label: 'split' },
                   { id: 'ir', label: 'ir' },
                   { id: 'analysis', label: 'bode / pz' },
+                  { id: 'docs', label: 'Documentation' },
                 ] as const
               ).map((m) => (
                 <button
                   key={m.id}
                   type="button"
+                  role="tab"
+                  aria-selected={paneMode === m.id}
                   onClick={() => setPaneMode(m.id)}
                   className={`px-2.5 py-1 text-[11px] font-mono uppercase rounded transition-colors cursor-pointer whitespace-nowrap ${
                     paneMode === m.id
@@ -460,7 +473,17 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
         </div>
 
         <div className="flex-1 flex flex-col min-h-0 overflow-y-auto">
-          {paneMode !== 'analysis' && (
+          {paneMode === 'docs' && (
+            <MarkdownGuideView
+              markdown={TEMPLATING_ENGINE_DOCS_MD}
+              onLoadTomlExample={(toml) => {
+                handleApplyText(toml);
+                setPaneMode('split');
+              }}
+            />
+          )}
+
+          {(paneMode === 'split' || paneMode === 'ir') && (
             <div
               className={`relative bg-[#07090E] ${
                 paneMode === 'split' ? 'min-h-[210px] shrink-0' : 'flex-1 min-h-[380px]'
@@ -476,7 +499,7 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
             </div>
           )}
 
-          {paneMode !== 'ir' && (
+          {(paneMode === 'split' || paneMode === 'analysis') && (
             <div className="shrink-0 flex flex-col">
               <div className="px-5 py-2 border-t border-slate-800 bg-[#0B0E17] flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-1 p-0.5 bg-[#07090E] border border-slate-800 rounded">
@@ -484,7 +507,9 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
                     [
                       { id: 'combined', label: 'Combined (Bode + Pole-Zero)' },
                       { id: 'bode', label: 'Bode Plot' },
+                      { id: 'nyquist', label: 'Nyquist Plot' },
                       { id: 'pz', label: 'Pole-Zero Map' },
+                      { id: 'sensitivity', label: 'S-Domain Sensitivity' },
                     ] as const
                   ).map((tab) => (
                     <button
@@ -535,6 +560,10 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
 
               {(analysisTab === 'bode' || analysisTab === 'combined') && (
                 <BodePlot model={model} />
+              )}
+              {analysisTab === 'nyquist' && <NyquistPlot model={model} />}
+              {analysisTab === 'sensitivity' && (
+                <SDomainSensitivityPlot model={model} />
               )}
               {(analysisTab === 'pz' || analysisTab === 'combined') && (
                 <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_288px]">

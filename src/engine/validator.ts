@@ -3,9 +3,20 @@ import { ControlModel, ValidationIssue, ValidationReport } from '../types/contro
 export function validateControlModel(model: ControlModel): ValidationReport {
   const issues: ValidationIssue[] = [];
 
-  // 1. Matrix dimension consistency checks
+  // 1. Matrix dimension & finite-value consistency checks
   const { n, m, p, A, B, C, D, x0 } = model.plant;
-  if (n <= 0 || m <= 0 || p <= 0) {
+  const hasNonFiniteMatrix = (mat: number[][]) =>
+    mat.some((row) => row.some((v) => !Number.isFinite(v)));
+  const hasNonFiniteVector = (vec: number[]) => vec.some((v) => !Number.isFinite(v));
+
+  if (
+    !Number.isInteger(n) ||
+    !Number.isInteger(m) ||
+    !Number.isInteger(p) ||
+    n <= 0 ||
+    m <= 0 ||
+    p <= 0
+  ) {
     issues.push({
       severity: 'error',
       code: 'MATRIX_DIM',
@@ -56,6 +67,22 @@ export function validateControlModel(model: ControlModel): ValidationReport {
       code: 'MATRIX_DIM',
       message: `Initial state x0 and LQR gain K must match state dimension n=${n}.`,
       detail: `x0 length=${x0.length}, K length=${model.lqrK.length}.`,
+      involvedBlocks: ['plant_ss', 'lqr_ctrl'],
+    });
+  }
+  if (
+    hasNonFiniteMatrix(A) ||
+    hasNonFiniteMatrix(B) ||
+    hasNonFiniteMatrix(C) ||
+    hasNonFiniteMatrix(D) ||
+    hasNonFiniteVector(x0) ||
+    hasNonFiniteVector(model.lqrK)
+  ) {
+    issues.push({
+      severity: 'error',
+      code: 'MATRIX_DIM',
+      message: 'State-space matrices (A, B, C, D), x0, and lqrK must contain only finite numbers.',
+      detail: 'Detected NaN or Infinity entry in plant state-space definition or gain vector.',
       involvedBlocks: ['plant_ss', 'lqr_ctrl'],
     });
   }
@@ -137,12 +164,34 @@ export function validateControlModel(model: ControlModel): ValidationReport {
   }
 
   // 3. Multi-rate compatibility checks
-  const baseDt = model.baseDt;
-  const fastDt = baseDt / Math.max(1, model.fastDtRatio);
+  const baseDtValid = Number.isFinite(model.baseDt) && model.baseDt > 0;
+  if (!baseDtValid) {
+    issues.push({
+      severity: 'error',
+      code: 'RATE_MISMATCH',
+      message: 'Base sample period baseDt must be a positive finite number.',
+      detail: `Received baseDt=${model.baseDt}.`,
+      involvedBlocks: [],
+    });
+  }
+  const safeBaseDt = baseDtValid ? model.baseDt : 0.01;
+  const safeLcmRatio = Number.isFinite(model.fastDtRatio) ? Math.max(1, model.fastDtRatio) : 1;
+  const fastDt = safeBaseDt / safeLcmRatio;
+
   for (const edge of effectiveEdges) {
     const src = blockMap.get(edge.from);
     const dst = blockMap.get(edge.to);
     if (!src || !dst) continue;
+    if (src.dt < 0 || dst.dt < 0 || !Number.isFinite(src.dt) || !Number.isFinite(dst.dt)) {
+      issues.push({
+        severity: 'error',
+        code: 'RATE_MISMATCH',
+        message: `Invalid negative or non-finite sample period on edge ${src.id} -> ${dst.id}.`,
+        detail: `Sample periods must be finite and >= 0 (received ${src.dt}s -> ${dst.dt}s).`,
+        involvedBlocks: [src.id, dst.id],
+      });
+      continue;
+    }
     if (src.dt === 0 || dst.dt === 0) continue; // continuous plant connected via ZOH/rate transition
 
     const ratio = Math.max(src.dt, dst.dt) / Math.min(src.dt, dst.dt);
@@ -159,7 +208,11 @@ export function validateControlModel(model: ControlModel): ValidationReport {
   }
 
   // Warn if saturation bounds are inverted
-  if (model.limits.satMin >= model.limits.satMax) {
+  if (
+    !Number.isFinite(model.limits.satMin) ||
+    !Number.isFinite(model.limits.satMax) ||
+    model.limits.satMin >= model.limits.satMax
+  ) {
     issues.push({
       severity: 'error',
       code: 'MATRIX_DIM',
@@ -174,9 +227,9 @@ export function validateControlModel(model: ControlModel): ValidationReport {
     executionOrder,
     issues,
     multiRateSummary: {
-      baseHz: Math.round(1 / baseDt),
-      fastHz: Math.round(1 / fastDt),
-      lcmRatio: Math.max(1, model.fastDtRatio),
+      baseHz: baseDtValid ? Math.round(1 / safeBaseDt) : 0,
+      fastHz: baseDtValid ? Math.round(1 / fastDt) : 0,
+      lcmRatio: safeLcmRatio,
     },
   };
 }

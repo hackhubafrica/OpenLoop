@@ -769,6 +769,13 @@ export interface StepResponseAnalysis {
   peakValue: number;
   overshootPct: number | null;
   settlingTimeSec: number | null;
+  riseTimeSec: number | null;
+  t10Sec: number | null;
+  t90Sec: number | null;
+  y10: number | null;
+  y90: number | null;
+  settlingBandLow: number | null;
+  settlingBandHigh: number | null;
   divergent: boolean;
 }
 
@@ -800,7 +807,9 @@ export function computeTransferFunctionStepResponse(
   model: ControlModel,
   mode: 'open' | 'closed' = 'open',
   outputIndex: number = model.pid.targetOutputIndex,
-  inputIndex: number = 0
+  inputIndex: number = 0,
+  durationSecOverride?: number,
+  numPoints: number = 140
 ): StepResponseAnalysis {
   const { n, A, B, C, D } = model.plant;
   const safeOut = Math.min(Math.max(0, outputIndex), Math.max(0, C.length - 1));
@@ -817,10 +826,15 @@ export function computeTransferFunctionStepResponse(
       ? analysis.closedLoopVerdict === 'UNSTABLE'
       : analysis.openLoopVerdict === 'UNSTABLE';
 
-  const horizonSec = chooseStepHorizon(activePoles, model.duration);
-  const numPts = 140;
+  const horizonSec =
+    durationSecOverride !== undefined && durationSecOverride > 0
+      ? durationSecOverride
+      : chooseStepHorizon(activePoles, model.duration);
+  const numPts = Math.max(40, Math.min(450, Math.round(numPoints)));
   const dt = horizonSec / numPts;
-  const subSteps = 4;
+
+  const maxPoleMag = Math.max(1, ...activePoles.map((p) => p.mag));
+  const subSteps = Math.max(4, Math.min(24, Math.ceil(dt * maxPoleMag * 4)));
   const h = dt / subSteps;
 
   // Determine analytical steady-state target when stable
@@ -947,14 +961,56 @@ export function computeTransferFunctionStepResponse(
   }
 
   let settlingTimeSec: number | null = null;
+  let settlingBandLow: number | null = null;
+  let settlingBandHigh: number | null = null;
   if (!isUnstable && !divergent && dcSteadyState !== null) {
-    const band = Math.max(1e-4, 0.02 * Math.max(1, Math.abs(dcSteadyState)));
+    const refSpan = Math.max(Math.abs(dcSteadyState - (points[0]?.y ?? 0)), Math.abs(dcSteadyState));
+    const band = refSpan > 1e-4 ? 0.02 * refSpan : 1e-4;
+    settlingBandLow = dcSteadyState - band;
+    settlingBandHigh = dcSteadyState + band;
     const lastOutsideIdx = points.reduce(
       (acc, pt, idx) => (Math.abs(pt.y - dcSteadyState) > band ? idx : acc),
       -1
     );
     if (lastOutsideIdx < points.length - 1) {
       settlingTimeSec = lastOutsideIdx >= 0 ? points[lastOutsideIdx + 1].t : 0;
+    }
+  }
+
+  // Rise time (10% -> 90% of step excursion from y(0) to steady-state)
+  let riseTimeSec: number | null = null;
+  let t10Sec: number | null = null;
+  let t90Sec: number | null = null;
+  let y10: number | null = null;
+  let y90: number | null = null;
+
+  if (!isUnstable && !divergent && points.length >= 2) {
+    const y0 = points[0].y;
+    const stepDelta = refSs - y0;
+    if (Math.abs(stepDelta) > 1e-6) {
+      y10 = y0 + 0.1 * stepDelta;
+      y90 = y0 + 0.9 * stepDelta;
+
+      const findCrossing = (frac: number): number | null => {
+        const pInit = (points[0].y - y0) / stepDelta;
+        if (pInit >= frac) return points[0].t;
+        for (let i = 0; i < points.length - 1; i++) {
+          const p0 = (points[i].y - y0) / stepDelta;
+          const p1 = (points[i + 1].y - y0) / stepDelta;
+          if (p0 < frac && p1 >= frac) {
+            const seg = p1 - p0;
+            const alpha = seg > 1e-12 ? (frac - p0) / seg : 0;
+            return points[i].t + alpha * (points[i + 1].t - points[i].t);
+          }
+        }
+        return null;
+      };
+
+      t10Sec = findCrossing(0.1);
+      t90Sec = findCrossing(0.9);
+      if (t10Sec !== null && t90Sec !== null && t90Sec >= t10Sec) {
+        riseTimeSec = t90Sec - t10Sec;
+      }
     }
   }
 
@@ -967,6 +1023,204 @@ export function computeTransferFunctionStepResponse(
     peakValue,
     overshootPct,
     settlingTimeSec,
+    riseTimeSec,
+    t10Sec,
+    t90Sec,
+    y10,
+    y90,
+    settlingBandLow,
+    settlingBandHigh,
+    divergent: divergent || isUnstable,
+  };
+}
+
+export interface ImpulseResponsePoint {
+  t: number;
+  h: number;
+}
+
+export interface ImpulseResponseAnalysis {
+  mode: 'open' | 'closed';
+  points: ImpulseResponsePoint[];
+  horizonSec: number;
+  initialValue: number;
+  peakValue: number;
+  peakTimeSec: number;
+  settlingTimeSec: number | null;
+  l2Energy: number;
+  divergent: boolean;
+}
+
+/**
+ * Computes unit impulse response h(t) for the active SISO channel (open-loop G(s)
+ * or closed-loop controller+plant with zero reference) via adaptive-substep RK4
+ * starting from the impulsive state jump x(0+) = B[:, inputIndex].
+ */
+export function computeImpulseResponse(
+  model: ControlModel,
+  mode: 'open' | 'closed' = 'closed',
+  outputIndex: number = model.pid.targetOutputIndex,
+  inputIndex: number = 0,
+  durationSecOverride?: number,
+  numPoints: number = 220
+): ImpulseResponseAnalysis {
+  const { n, A, B, C, D } = model.plant;
+  const safeOut = Math.min(Math.max(0, outputIndex), Math.max(0, C.length - 1));
+  const safeIn = Math.min(Math.max(0, inputIndex), Math.max(0, (B[0]?.length ?? 1) - 1));
+
+  const cRow = C[safeOut] ?? Array(n).fill(0);
+  const bCol = B.map((r) => r[safeIn] ?? 0);
+  const dVal = D[safeOut]?.[safeIn] ?? 0;
+
+  const analysis = analyzeSystemStability(model, safeOut, safeIn);
+  const activePoles = mode === 'closed' ? analysis.closedLoopPoles : analysis.openLoopPoles;
+  const isUnstable =
+    mode === 'closed'
+      ? analysis.closedLoopVerdict === 'UNSTABLE'
+      : analysis.openLoopVerdict === 'UNSTABLE';
+
+  const horizonSec =
+    durationSecOverride !== undefined && durationSecOverride > 0
+      ? durationSecOverride
+      : chooseStepHorizon(activePoles, model.duration);
+  const numPts = Math.max(40, Math.min(450, Math.round(numPoints)));
+  const dt = horizonSec / numPts;
+
+  const maxPoleMag = Math.max(1, ...activePoles.map((p) => p.mag));
+  const subSteps = Math.max(4, Math.min(24, Math.ceil(dt * maxPoleMag * 4)));
+  const hStep = dt / subSteps;
+
+  const pidOutIdx = Math.min(
+    Math.max(0, model.pid.targetOutputIndex),
+    Math.max(0, C.length - 1)
+  );
+  const cyPid = C[pidOutIdx] ?? Array(n).fill(0);
+  const dPid = D[pidOutIdx]?.[0] ?? 0;
+  const N = Math.max(0.1, model.pid.nFilter);
+
+  const computeUClosedImpulse = (x: number[], eInt: number, xFilt: number): number => {
+    let uLqr = 0;
+    for (let i = 0; i < n; i++) {
+      uLqr += -(model.lqrK[i] ?? 0) * x[i];
+    }
+    if (!model.pid.enabled) return uLqr;
+
+    let cyx = 0;
+    for (let i = 0; i < n; i++) cyx += cyPid[i] * x[i];
+    const gFb = model.pid.kp + model.pid.kd * N;
+    const denom = Math.abs(1 + gFb * dPid) > 1e-9 ? 1 + gFb * dPid : 1;
+    const errNoD = -cyx;
+    const uMem = uLqr + model.pid.ki * eInt - model.pid.kd * N * xFilt;
+    return (uMem + gFb * errNoD) / denom;
+  };
+
+  // Initial state immediately after unit impulse delta(t): x(0+) = B_col, e_i = 0, x_f = 0
+  let state = Array(n + 2).fill(0);
+  for (let i = 0; i < n; i++) {
+    state[i] = bCol[i];
+  }
+
+  const evalOutput = (s: number[]): number => {
+    let y = 0;
+    for (let i = 0; i < n; i++) y += cRow[i] * s[i];
+    if (mode === 'closed') {
+      const u = computeUClosedImpulse(s, s[n], s[n + 1]);
+      y += dVal * u;
+    }
+    return y;
+  };
+
+  const deriv = (s: number[]): number[] => {
+    const out = Array(n + 2).fill(0);
+    if (mode === 'open') {
+      for (let i = 0; i < n; i++) {
+        let sum = 0;
+        for (let j = 0; j < n; j++) sum += A[i][j] * s[j];
+        out[i] = sum;
+      }
+      return out;
+    }
+
+    const u = computeUClosedImpulse(s, s[n], s[n + 1]);
+    for (let i = 0; i < n; i++) {
+      let sum = (B[i]?.[0] ?? 0) * u;
+      for (let j = 0; j < n; j++) sum += A[i][j] * s[j];
+      out[i] = sum;
+    }
+
+    if (model.pid.enabled) {
+      let yPid = dPid * u;
+      for (let i = 0; i < n; i++) yPid += cyPid[i] * s[i];
+      const err = -yPid;
+      out[n] = Math.abs(model.pid.ki) > 1e-12 ? err : 0;
+      out[n + 1] = N * (err - s[n + 1]);
+    }
+    return out;
+  };
+
+  const points: ImpulseResponsePoint[] = [];
+  let divergent = false;
+  const h0 = evalOutput(state);
+  points.push({ t: 0, h: h0 });
+
+  for (let step = 1; step <= numPts; step++) {
+    for (let sub = 0; sub < subSteps; sub++) {
+      const k1 = deriv(state);
+      const k2 = deriv(state.map((v, i) => v + 0.5 * hStep * k1[i]));
+      const k3 = deriv(state.map((v, i) => v + 0.5 * hStep * k2[i]));
+      const k4 = deriv(state.map((v, i) => v + hStep * k3[i]));
+      state = state.map(
+        (v, i) => v + (hStep / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i])
+      );
+    }
+
+    const hVal = evalOutput(state);
+    if (!Number.isFinite(hVal) || Math.abs(hVal) > 1e6) {
+      divergent = true;
+      break;
+    }
+    points.push({ t: step * dt, h: hVal });
+  }
+
+  let peakValue = points[0]?.h ?? 0;
+  let peakTimeSec = points[0]?.t ?? 0;
+  let l2Energy = 0;
+
+  for (let i = 0; i < points.length; i++) {
+    const pt = points[i];
+    if (Math.abs(pt.h) > Math.abs(peakValue)) {
+      peakValue = pt.h;
+      peakTimeSec = pt.t;
+    }
+    if (i > 0) {
+      const prev = points[i - 1];
+      const segDt = pt.t - prev.t;
+      l2Energy += 0.5 * (prev.h * prev.h + pt.h * pt.h) * segDt;
+    }
+  }
+
+  let settlingTimeSec: number | null = null;
+  const peakAbs = Math.abs(peakValue);
+  if (!isUnstable && !divergent && peakAbs > 1e-10) {
+    const band = 0.02 * peakAbs;
+    const lastOutsideIdx = points.reduce(
+      (acc, pt, idx) => (Math.abs(pt.h) > band ? idx : acc),
+      -1
+    );
+    if (lastOutsideIdx < points.length - 1) {
+      settlingTimeSec = lastOutsideIdx >= 0 ? points[lastOutsideIdx + 1].t : 0;
+    }
+  }
+
+  return {
+    mode,
+    points,
+    horizonSec,
+    initialValue: h0,
+    peakValue,
+    peakTimeSec,
+    settlingTimeSec,
+    l2Energy,
     divergent: divergent || isUnstable,
   };
 }
@@ -1263,6 +1517,1002 @@ export function generateLatexStabilityReport(
 
   return lines.join('\n');
 }
+
+export interface SPlaneHeatmapCell {
+  re: number; // sigma
+  im: number; // j*omega
+  marginScore: number; // [-1, +1]: < 0 unstable/out-of-spec, 0 boundary, +1 deep stable margin
+  timeConstantSec: number | null; // -1 / re when re < 0
+  dampingRatio: number; // -re / |s|
+  poleDistance: number; // closest active pole distance
+  inStableRegion: boolean; // re < 0, re <= -1/tau_max, damping >= minDampingRatio, scaled controller stable
+}
+
+export interface SPlaneStabilityHeatmap {
+  cells: SPlaneHeatmapCell[];
+  cols: number;
+  rows: number;
+  xDomain: [number, number];
+  yDomain: [number, number];
+  sigmaThreshold: number; // -1 / maxTimeConstantSec
+  gainScale: number;
+  maxTimeConstantSec: number;
+  minDampingRatio: number;
+  activeMaxRealPart: number;
+  activeSystemStable: boolean;
+  dominantTimeConstantSec: number | null;
+  meetsTimeConstantSpec: boolean;
+  stableGainRange: {
+    min: number | null;
+    max: number | null;
+    specMax: number | null;
+  };
+  scaledPoles: Array<{ re: number; im: number }>;
+}
+
+/**
+ * Computes an interactive s-plane Stability Margin heatmap & stable gain/time-constant
+ * parameter envelope for the active controller gains (PID + LQR).
+ */
+export function computeSPlaneStabilityHeatmap(
+  model: ControlModel,
+  xDomain: [number, number],
+  yDomain: [number, number],
+  options?: {
+    scope?: 'closed' | 'open';
+    gainScale?: number;
+    maxTimeConstantSec?: number;
+    minDampingRatio?: number;
+    cols?: number;
+    rows?: number;
+  }
+): SPlaneStabilityHeatmap {
+  const scope = options?.scope ?? 'closed';
+  const gainScale = Math.max(0.01, options?.gainScale ?? 1.0);
+  const maxTimeConstantSec = Math.max(0.02, options?.maxTimeConstantSec ?? 1.0);
+  const minDampingRatio = Math.min(0.95, Math.max(0, options?.minDampingRatio ?? 0.2));
+  const cols = options?.cols ?? 44;
+  const rows = options?.rows ?? 26;
+
+  const buildScaledModel = (scale: number): ControlModel => ({
+    ...model,
+    lqrK: model.lqrK.map((k) => k * scale),
+    pid: {
+      ...model.pid,
+      kp: model.pid.kp * scale,
+      ki: model.pid.ki * scale,
+      kd: model.pid.kd * scale,
+    },
+  });
+
+  const activeMatrix =
+    scope === 'closed'
+      ? buildClosedLoopMatrix(buildScaledModel(gainScale))
+      : model.plant.A;
+
+  const scaledPoles = computeMatrixEigenvalues(activeMatrix);
+  const activeMaxRealPart =
+    scaledPoles.length > 0 ? Math.max(...scaledPoles.map((p) => p.re)) : 0;
+  const activeSystemStable = activeMaxRealPart < -1e-6;
+  const dominantTimeConstantSec =
+    activeMaxRealPart < -1e-6 ? -1 / activeMaxRealPart : null;
+  const sigmaThreshold = -1 / maxTimeConstantSec;
+  const meetsTimeConstantSpec = activeMaxRealPart <= sigmaThreshold + 1e-6;
+
+  // Sweep gain multiplier K in [0.05, 8.0] in Closed-Loop scope to extract exact stable parameter interval
+  let stableMin: number | null = null;
+  let stableMax: number | null = null;
+  let specMax: number | null = null;
+
+  if (scope === 'closed') {
+    const numSweep = 48;
+    const minSweep = 0.05;
+    const maxSweep = 8.0;
+    for (let sIdx = 0; sIdx < numSweep; sIdx++) {
+      const kScale =
+        minSweep * Math.pow(maxSweep / minSweep, sIdx / (numSweep - 1));
+      const eigs = computeMatrixEigenvalues(
+        buildClosedLoopMatrix(buildScaledModel(kScale))
+      );
+      const maxRe = eigs.length > 0 ? Math.max(...eigs.map((p) => p.re)) : 0;
+      if (maxRe < -1e-5) {
+        if (stableMin === null) stableMin = kScale;
+        stableMax = kScale;
+        if (maxRe <= sigmaThreshold) {
+          specMax = kScale;
+        }
+      }
+    }
+  } else if (activeSystemStable) {
+    stableMin = 1.0;
+    stableMax = 1.0;
+    if (meetsTimeConstantSpec) specMax = 1.0;
+  }
+
+  const [xMin, xMax] = xDomain;
+  const [yMin, yMax] = yDomain;
+  const dx = (xMax - xMin) / cols;
+  const dy = (yMax - yMin) / rows;
+  const domainScale = Math.max(1, (xMax - xMin) * 0.35);
+
+  const cells: SPlaneHeatmapCell[] = [];
+
+  for (let r = 0; r < rows; r++) {
+    // Top-down or bottom-up row centers
+    const im = yMax - (r + 0.5) * dy;
+    for (let c = 0; c < cols; c++) {
+      const re = xMin + (c + 0.5) * dx;
+      const sMag = Math.hypot(re, im);
+      const dampingRatio = sMag > 1e-9 ? -re / sMag : 0;
+      const timeConstantSec = re < -1e-5 ? -1 / re : null;
+
+      let poleDistance = domainScale;
+      if (scaledPoles.length > 0) {
+        poleDistance = Infinity;
+        for (const p of scaledPoles) {
+          const d = Math.hypot(re - p.re, im - p.im);
+          if (d < poleDistance) poleDistance = d;
+        }
+      }
+
+      let marginScore: number;
+      let inStableRegion = false;
+
+      if (re >= 0) {
+        // RHP unstable zone: deep negative margin proportional to Re(s) > 0
+        const rhpNorm = Math.min(1, re / Math.max(0.5, xMax));
+        marginScore = -(0.35 + 0.65 * rhpNorm);
+      } else {
+        // LHP: evaluate decay margin vs sigmaThreshold = -1 / maxTimeConstantSec
+        const tauDelta = sigmaThreshold - re; // > 0 when faster than target tau_max
+        const tauNorm = Math.tanh(
+          tauDelta / Math.max(0.25, Math.abs(sigmaThreshold) * 0.8)
+        );
+        const dampPenalty =
+          dampingRatio >= minDampingRatio
+            ? 1.0
+            : Math.max(0.1, dampingRatio / Math.max(0.05, minDampingRatio));
+
+        // Resonance notch near active poles (reflects sensitivity peaking near eigenvalues)
+        const poleClearance =
+          1 - 0.32 * Math.exp(-Math.pow(poleDistance / (0.16 * domainScale), 2));
+
+        inStableRegion =
+          re <= sigmaThreshold &&
+          dampingRatio >= minDampingRatio &&
+          activeSystemStable;
+
+        if (tauNorm >= 0) {
+          marginScore = Math.min(1, tauNorm * dampPenalty * poleClearance);
+          if (!activeSystemStable) {
+            // Current controller gains are unstable -> warn region down to marginal amber
+            marginScore = Math.min(marginScore * 0.25, 0.2);
+          }
+        } else {
+          // Slow LHP zone between sigmaThreshold and jw axis (0 > re > -1/tau_max)
+          marginScore = Math.max(-0.34, tauNorm * 0.34);
+        }
+      }
+
+      cells.push({
+        re,
+        im,
+        marginScore,
+        timeConstantSec,
+        dampingRatio,
+        poleDistance,
+        inStableRegion,
+      });
+    }
+  }
+
+  return {
+    cells,
+    cols,
+    rows,
+    xDomain,
+    yDomain,
+    sigmaThreshold,
+    gainScale,
+    maxTimeConstantSec,
+    minDampingRatio,
+    activeMaxRealPart,
+    activeSystemStable,
+    dominantTimeConstantSec,
+    meetsTimeConstantSpec,
+    stableGainRange: {
+      min: stableMin,
+      max: stableMax,
+      specMax,
+    },
+    scaledPoles,
+  };
+}
+
+export interface StateSpaceParameterOption {
+  id: string;
+  symbol: string;
+  name: string;
+  unit: string;
+  nominalDisplay: string;
+  description: string;
+  applyFactor: (model: ControlModel, alpha: number) => ControlModel;
+}
+
+export interface SensitivityTrajectoryPoint {
+  factor: number;
+  re: number;
+  im: number;
+  sensitivity: number;
+  normSensitivity: number;
+  dampingRatio: number | null;
+  naturalFreqRad: number;
+  stable: boolean;
+}
+
+export interface SensitivityBranch {
+  id: number;
+  nominalPole: { re: number; im: number; stable: boolean };
+  points: SensitivityTrajectoryPoint[];
+  peakSensitivity: number;
+  meanSensitivity: number;
+  maxRealPart: number;
+  minRealPart: number;
+  realSpan: number;
+  imagSpan: number;
+  criticalFactor: number | null;
+}
+
+export interface SDomainSensitivityAnalysis {
+  parameter: Omit<StateSpaceParameterOption, 'applyFactor'>;
+  scope: 'open' | 'closed';
+  minFactor: number;
+  maxFactor: number;
+  activeFactor: number;
+  branches: SensitivityBranch[];
+  activePoles: SensitivityTrajectoryPoint[];
+  maxSensitivity: number;
+  nominalMaxRealPart: number;
+  activeMaxRealPart: number;
+  nominalStable: boolean;
+  activeStable: boolean;
+  stableFactorRange: { min: number | null; max: number | null };
+}
+
+function clonePlantScaled(
+  model: ControlModel,
+  scaleA: (row: number, col: number, val: number) => number,
+  scaleB?: (row: number, col: number, val: number) => number
+): ControlModel {
+  return {
+    ...model,
+    plant: {
+      ...model.plant,
+      A: model.plant.A.map((r, i) => r.map((v, j) => scaleA(i, j, v))),
+      B: model.plant.B.map((r, i) =>
+        r.map((v, j) => (scaleB ? scaleB(i, j, v) : v))
+      ),
+    },
+  };
+}
+
+/**
+ * Extracts meaningful physical parameters (for standard electro-mechanical / power plants)
+ * plus significant non-zero A/B matrix entries so any imported or TF-synthesized model
+ * supports S-Domain pole sensitivity analysis.
+ */
+export function getModelSensitivityParameters(
+  model: ControlModel
+): StateSpaceParameterOption[] {
+  const { n, A, B, stateNames } = model.plant;
+  const options: StateSpaceParameterOption[] = [];
+  const safeAlpha = (a: number) => Math.max(1e-4, a);
+
+  const isMsd =
+    model.id === 'mass_spring_damper' ||
+    (n === 2 &&
+      Math.abs(A[0]?.[0] ?? 1) < 1e-9 &&
+      Math.abs((A[0]?.[1] ?? 0) - 1) < 1e-6 &&
+      (A[1]?.[0] ?? 0) < -1e-6 &&
+      Math.abs((B[1]?.[0] ?? 0) - 1) < 1e-6);
+
+  const isDcMotor =
+    !isMsd &&
+    n === 2 &&
+    (model.id === 'dcmotor' || model.basePreset === 'dcmotor') &&
+    Math.abs(B[0]?.[0] ?? 0) < 1e-9 &&
+    Math.abs(B[1]?.[0] ?? 0) > 1;
+
+  const isBuck =
+    !isMsd &&
+    n === 2 &&
+    (model.id === 'buck' || model.basePreset === 'buck') &&
+    Math.abs(B[0]?.[0] ?? 0) > 100 &&
+    Math.abs(B[1]?.[0] ?? 0) < 1e-9;
+
+  const isGasHumidity =
+    model.id === 'esp32_gas_humidity_relay' && n === 2;
+
+  const isUltrasonic =
+    model.id === 'esp32_ultrasonic_hold' && n === 2;
+
+  const isPendulum =
+    n >= 4 &&
+    (model.id === 'pendulum' || model.basePreset === 'pendulum') &&
+    Math.abs(A[3]?.[2] ?? 0) > 1;
+
+  if (isUltrasonic) {
+    const dampVal = Math.abs(A[1]?.[1] ?? 3.2);
+    const gainVal = Math.abs(B[1]?.[0] ?? 0.045);
+    options.push(
+      {
+        id: 'us_damping',
+        symbol: 'c_act',
+        name: 'Actuator Damping',
+        unit: '1/s',
+        nominalDisplay: `${Number(dampVal.toPrecision(3))} 1/s`,
+        description: 'Scales velocity damping term A[1,1] = −c_act in ranging dynamics',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            i === 1 && j === 1 ? v * a : v
+          );
+        },
+      },
+      {
+        id: 'us_gain',
+        symbol: 'K_u',
+        name: 'Drive Sensitivity',
+        unit: 'm/(s²·%)',
+        nominalDisplay: `${Number(gainVal.toPrecision(3))}`,
+        description: 'Scales PWM/actuator input authority B[1,0]',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(
+            mdl,
+            (_i, _j, v) => v,
+            (i, _j, v) => (i === 1 ? v * a : v)
+          );
+        },
+      }
+    );
+  } else if (isGasHumidity) {
+    const gasDecay = Math.abs(A[0]?.[0] ?? 0.45);
+    const rhCross = Math.abs(A[0]?.[1] ?? 0.08);
+    const rhDecay = Math.abs(A[1]?.[1] ?? 0.22);
+    options.push(
+      {
+        id: 'gas_decay',
+        symbol: 'λ_gas',
+        name: 'Chamber Ventilation Rate',
+        unit: '1/s',
+        nominalDisplay: `${Number(gasDecay.toPrecision(3))} 1/s`,
+        description: 'Scales MQ gas concentration decay entry A[0,0]',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            i === 0 && j === 0 ? v * a : v
+          );
+        },
+      },
+      {
+        id: 'rh_coupling',
+        symbol: 'κ_RH',
+        name: 'Humidity Cross-Sensitivity',
+        unit: 'ppm/%RH·s',
+        nominalDisplay: `${Number(rhCross.toPrecision(3))}`,
+        description: 'Scales humidity-to-MQ drift coupling A[0,1]',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            i === 0 && j === 1 ? v * a : v
+          );
+        },
+      },
+      {
+        id: 'rh_decay',
+        symbol: 'λ_RH',
+        name: 'Humidity Time Constant',
+        unit: '1/s',
+        nominalDisplay: `${Number(rhDecay.toPrecision(3))} 1/s`,
+        description: 'Scales relative humidity pole entry A[1,1]',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            i === 1 && j === 1 ? v * a : v
+          );
+        },
+      }
+    );
+  } else if (isMsd) {
+    const kVal = Math.abs(A[1]?.[0] ?? 16);
+    const cVal = Math.abs(A[1]?.[1] ?? 1.2);
+    const mVal = 1 / Math.max(1e-6, Math.abs(B[1]?.[0] ?? 1));
+    options.push(
+      {
+        id: 'msd_mass',
+        symbol: 'm',
+        name: 'Cart Mass',
+        unit: 'kg',
+        nominalDisplay: `${Number(mVal.toPrecision(3))} kg`,
+        description: 'Scales inertia row (−k/m, −c/m, 1/m) inversely with mass m',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(
+            mdl,
+            (i, _j, v) => (i === 1 ? v / a : v),
+            (i, _j, v) => (i === 1 ? v / a : v)
+          );
+        },
+      },
+      {
+        id: 'msd_stiffness',
+        symbol: 'k',
+        name: 'Spring Stiffness',
+        unit: 'N/m',
+        nominalDisplay: `${Number((kVal * mVal).toPrecision(3))} N/m`,
+        description: 'Scales restoring spring entry A[1,0] = −k/m',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            i === 1 && j === 0 ? v * a : v
+          );
+        },
+      },
+      {
+        id: 'msd_damping',
+        symbol: 'c',
+        name: 'Viscous Damping',
+        unit: 'N·s/m',
+        nominalDisplay: `${Number((cVal * mVal).toPrecision(3))} N·s/m`,
+        description: 'Scales viscous damping entry A[1,1] = −c/m',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            i === 1 && j === 1 ? v * a : v
+          );
+        },
+      }
+    );
+  } else if (isDcMotor) {
+    const b1 = Math.max(1e-6, Math.abs(B[1]?.[0] ?? 125));
+    const lHenries = 1 / b1;
+    const rOhms = Math.abs(A[1]?.[1] ?? -175) * lHenries;
+    options.push(
+      {
+        id: 'motor_inductance',
+        symbol: 'L',
+        name: 'Armature Inductance',
+        unit: 'mH',
+        nominalDisplay: `${Number((lHenries * 1000).toPrecision(3))} mH`,
+        description:
+          'Scales current dynamics row (−Ke/L, −R/L, 1/L) inversely with inductance L',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(
+            mdl,
+            (i, _j, v) => (i === 1 ? v / a : v),
+            (i, _j, v) => (i === 1 ? v / a : v)
+          );
+        },
+      },
+      {
+        id: 'motor_resistance',
+        symbol: 'R',
+        name: 'Armature Resistance',
+        unit: 'Ω',
+        nominalDisplay: `${Number(rOhms.toPrecision(3))} Ω`,
+        description: 'Scales electrical damping entry A[1,1] = −R/L',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            i === 1 && j === 1 ? v * a : v
+          );
+        },
+      },
+      {
+        id: 'motor_inertia',
+        symbol: 'J',
+        name: 'Rotor Inertia',
+        unit: 'kg·m²',
+        nominalDisplay: '1.0× J₀',
+        description: 'Scales mechanical row (−b/J, Kt/J) inversely with rotor inertia J',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, _j, v) => (i === 0 ? v / a : v));
+        },
+      }
+    );
+  } else if (isBuck) {
+    const invL = Math.max(1e-6, Math.abs(A[0]?.[1] ?? 10000));
+    const invC = Math.max(1e-6, Math.abs(A[1]?.[0] ?? 4545.45));
+    const lUh = (1 / invL) * 1e6;
+    const cUf = (1 / invC) * 1e6;
+    const rLoad = invC / Math.max(1e-6, Math.abs(A[1]?.[1] ?? 1136.36));
+    options.push(
+      {
+        id: 'buck_inductance',
+        symbol: 'L',
+        name: 'Filter Inductance',
+        unit: 'μH',
+        nominalDisplay: `${Math.round(lUh)} μH`,
+        description:
+          'Scales inductor current row (−R_esr/L, −1/L, V_in/L) inversely with L',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(
+            mdl,
+            (i, _j, v) => (i === 0 ? v / a : v),
+            (i, _j, v) => (i === 0 ? v / a : v)
+          );
+        },
+      },
+      {
+        id: 'buck_capacitance',
+        symbol: 'C',
+        name: 'Output Capacitance',
+        unit: 'μF',
+        nominalDisplay: `${Math.round(cUf)} μF`,
+        description:
+          'Scales capacitor voltage row (1/C, −1/(R_load·C)) inversely with C',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, _j, v) => (i === 1 ? v / a : v));
+        },
+      },
+      {
+        id: 'buck_load',
+        symbol: 'R_load',
+        name: 'Load Resistance',
+        unit: 'Ω',
+        nominalDisplay: `${Number(rLoad.toPrecision(3))} Ω`,
+        description: 'Scales output RC bleed entry A[1,1] = −1/(R_load·C) inversely',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            i === 1 && j === 1 ? v / a : v
+          );
+        },
+      }
+    );
+  } else if (isPendulum) {
+    const b30 = Math.max(1e-6, Math.abs(B[3]?.[0] ?? 2));
+    const b10 = Math.max(1e-6, Math.abs(B[1]?.[0] ?? 1));
+    const lMeters = b10 / b30;
+    const cartMass = 1 / b10;
+    const friction = Math.abs(A[1]?.[1] ?? 0.1) * cartMass;
+    options.push(
+      {
+        id: 'pendulum_length',
+        symbol: 'l',
+        name: 'Pendulum Length',
+        unit: 'm',
+        nominalDisplay: `${Number(lMeters.toPrecision(3))} m`,
+        description:
+          'Scales angular acceleration coupling (A[3,1], A[3,2], B[3,0]) inversely with rod length l',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(
+            mdl,
+            (i, j, v) => (i === 3 && (j === 1 || j === 2) ? v / a : v),
+            (i, _j, v) => (i === 3 ? v / a : v)
+          );
+        },
+      },
+      {
+        id: 'pendulum_mass',
+        symbol: 'M',
+        name: 'Cart Mass',
+        unit: 'kg',
+        nominalDisplay: `${Number(cartMass.toPrecision(3))} kg`,
+        description: 'Scales force effectiveness and cart momentum coupling inversely with M',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(
+            mdl,
+            (i, j, v) =>
+              (i === 1 && (j === 1 || j === 2)) || (i === 3 && j === 1)
+                ? v / a
+                : v,
+            (i, _j, v) => (i === 1 || i === 3 ? v / a : v)
+          );
+        },
+      },
+      {
+        id: 'pendulum_friction',
+        symbol: 'b',
+        name: 'Cart Friction',
+        unit: 'N·s/m',
+        nominalDisplay: `${Number(friction.toPrecision(3))} N·s/m`,
+        description: 'Scales linear viscous friction damping terms A[1,1] and A[3,1]',
+        applyFactor: (mdl, alpha) => {
+          const a = safeAlpha(alpha);
+          return clonePlantScaled(mdl, (i, j, v) =>
+            (i === 1 || i === 3) && j === 1 ? v * a : v
+          );
+        },
+      }
+    );
+  }
+
+  // Extract dynamic non-zero A[i,j] matrix entries for any generic/imported/TF model
+  const matrixEntries: { i: number; j: number; val: number; absVal: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const val = A[i]?.[j] ?? 0;
+      if (Math.abs(val) > 1e-9) {
+        matrixEntries.push({ i, j, val, absVal: Math.abs(val) });
+      }
+    }
+  }
+  matrixEntries.sort((a, b) => {
+    // Prioritize diagonal damping entries and strong couplings
+    const aScore = a.i === a.j ? a.absVal * 1.4 : a.absVal;
+    const bScore = b.i === b.j ? b.absVal * 1.4 : b.absVal;
+    return bScore - aScore;
+  });
+
+  const maxMatrixAdditions = options.length > 0 ? 3 : 6;
+  for (const entry of matrixEntries.slice(0, maxMatrixAdditions)) {
+    const sRow = stateNames[entry.i] ?? `x${entry.i}`;
+    const sCol = stateNames[entry.j] ?? `x${entry.j}`;
+    const labelSuffix = entry.i === entry.j ? 'Self-Damping' : 'Coupling';
+    options.push({
+      id: `A_${entry.i}_${entry.j}`,
+      symbol: `A[${entry.i},${entry.j}]`,
+      name: `${sRow} ← ${sCol} (${labelSuffix})`,
+      unit: '1/s',
+      nominalDisplay: Number(entry.val.toPrecision(4)).toString(),
+      description: `Direct state-matrix entry A[${entry.i},${entry.j}] (${sRow} derivative wrt ${sCol})`,
+      applyFactor: (mdl, alpha) => {
+        const a = safeAlpha(alpha);
+        return clonePlantScaled(mdl, (i, j, v) =>
+          i === entry.i && j === entry.j ? v * a : v
+        );
+      },
+    });
+  }
+
+  if (options.length === 0) {
+    options.push({
+      id: 'plant_gain_B',
+      symbol: 'B',
+      name: 'Input Gain Matrix B',
+      unit: 'pu',
+      nominalDisplay: '1.0× B₀',
+      description: 'Uniformly scales actuator input effectiveness matrix B',
+      applyFactor: (mdl, alpha) => {
+        const a = safeAlpha(alpha);
+        return clonePlantScaled(
+          mdl,
+          (_i, _j, v) => v,
+          (_i, _j, v) => v * a
+        );
+      },
+    });
+  }
+
+  return options;
+}
+
+/**
+ * Finds the permutation `perm` of `next` that minimizes sum of Euclidean distances
+ * between `prev[i]` and `next[perm[i]]`, preserving continuous pole trajectories.
+ */
+function matchEigenvalueOrder<T extends { re: number; im: number }>(
+  prev: T[],
+  next: T[]
+): T[] {
+  const m = prev.length;
+  if (m === 0 || next.length !== m) return next;
+
+  if (m <= 10) {
+    const size = 1 << m;
+    const dp = new Float64Array(size).fill(Infinity);
+    const parent = new Int32Array(size).fill(-1);
+    dp[0] = 0;
+
+    for (let mask = 0; mask < size - 1; mask++) {
+      const baseCost = dp[mask];
+      if (!Number.isFinite(baseCost)) continue;
+      // Count bits set = index in `prev` being matched next
+      let i = 0;
+      let tmp = mask;
+      while (tmp) {
+        i += tmp & 1;
+        tmp >>= 1;
+      }
+      if (i >= m) continue;
+      const p = prev[i];
+      for (let j = 0; j < m; j++) {
+        if (mask & (1 << j)) continue;
+        const nMask = mask | (1 << j);
+        const dist = Math.hypot(p.re - next[j].re, p.im - next[j].im);
+        const cand = baseCost + dist;
+        if (cand < dp[nMask]) {
+          dp[nMask] = cand;
+          parent[nMask] = j;
+        }
+      }
+    }
+
+    const order = new Array<number>(m).fill(0);
+    let mask = size - 1;
+    for (let i = m - 1; i >= 0; i--) {
+      const chosen = parent[mask];
+      order[i] = chosen >= 0 ? chosen : i;
+      mask &= ~(1 << order[i]);
+    }
+    return order.map((idx) => next[idx]);
+  }
+
+  // Greedy fallback for unusually large dimensions > 10
+  const used = new Array<boolean>(m).fill(false);
+  return prev.map((p) => {
+    let bestJ = 0;
+    let bestD = Infinity;
+    for (let j = 0; j < m; j++) {
+      if (used[j]) continue;
+      const d = Math.hypot(p.re - next[j].re, p.im - next[j].im);
+      if (d < bestD) {
+        bestD = d;
+        bestJ = j;
+      }
+    }
+    used[bestJ] = true;
+    return next[bestJ];
+  });
+}
+
+function makeTrajectoryRawPole(re: number, im: number) {
+  const cleanRe = Math.abs(re) < 1e-11 ? 0 : re;
+  const cleanIm = Math.abs(im) < 1e-11 ? 0 : im;
+  const mag = Math.hypot(cleanRe, cleanIm);
+  return {
+    re: cleanRe,
+    im: cleanIm,
+    naturalFreqRad: mag,
+    dampingRatio: mag > 1e-9 ? -cleanRe / mag : null,
+    stable: cleanRe < -TOL,
+  };
+}
+
+/**
+ * Computes S-domain pole shift trajectories and normalized sensitivity |dλ / d(ln p)|
+ * across multiplicative parameter variations α ∈ [minFactor, maxFactor] centered at α = 1.0.
+ */
+export function computeSDomainSensitivity(
+  model: ControlModel,
+  parameterId?: string,
+  options: {
+    scope?: 'open' | 'closed';
+    minFactor?: number;
+    maxFactor?: number;
+    steps?: number;
+    activeFactor?: number;
+  } = {}
+): SDomainSensitivityAnalysis {
+  const params = getModelSensitivityParameters(model);
+  const selected =
+    params.find((p) => p.id === parameterId) ?? params[0];
+
+  const scope = options.scope ?? 'closed';
+  const minFactor = Math.max(0.05, Math.min(0.95, options.minFactor ?? 0.25));
+  const maxFactor = Math.max(1.05, Math.min(8.0, options.maxFactor ?? 2.5));
+  const activeFactor = Math.max(
+    minFactor,
+    Math.min(maxFactor, options.activeFactor ?? 1.0)
+  );
+  const totalSteps = Math.max(21, Math.min(121, Math.round(options.steps ?? 55)));
+
+  const evalEigsAt = (factor: number) => {
+    const perturbed = selected.applyFactor(model, factor);
+    const mat =
+      scope === 'closed' ? buildClosedLoopMatrix(perturbed) : perturbed.plant.A;
+    return computeMatrixEigenvalues(mat).map((e) => makeTrajectoryRawPole(e.re, e.im));
+  };
+
+  // Sweep outward from nominal alpha = 1.0 in log-space for optimal branch continuity
+  const logMin = Math.log(minFactor);
+  const logMax = Math.log(maxFactor);
+  const logSpan = Math.max(1e-6, logMax - logMin);
+  const lowShare = Math.abs(0 - logMin) / logSpan;
+  const lowSteps = Math.max(6, Math.round((totalSteps - 1) * lowShare));
+  const highSteps = Math.max(6, totalSteps - 1 - lowSteps);
+
+  const lowFactors: number[] = [];
+  for (let i = 1; i <= lowSteps; i++) {
+    lowFactors.push(Math.exp((i / lowSteps) * logMin));
+  }
+  const highFactors: number[] = [];
+  for (let i = 1; i <= highSteps; i++) {
+    highFactors.push(Math.exp((i / highSteps) * logMax));
+  }
+
+  const nominalRaw = evalEigsAt(1.0);
+  const numBranches = nominalRaw.length;
+
+  // Sweep downward from 1.0 -> minFactor
+  const lowerSlices: { factor: number; eigs: ReturnType<typeof evalEigsAt> }[] = [];
+  let prevLower = nominalRaw;
+  for (const f of lowFactors) {
+    const matched = matchEigenvalueOrder(prevLower, evalEigsAt(f));
+    lowerSlices.push({ factor: f, eigs: matched });
+    prevLower = matched;
+  }
+
+  // Sweep upward from 1.0 -> maxFactor
+  const upperSlices: { factor: number; eigs: ReturnType<typeof evalEigsAt> }[] = [];
+  let prevUpper = nominalRaw;
+  for (const f of highFactors) {
+    const matched = matchEigenvalueOrder(prevUpper, evalEigsAt(f));
+    upperSlices.push({ factor: f, eigs: matched });
+    prevUpper = matched;
+  }
+
+  const orderedSlices = [
+    ...lowerSlices.reverse(),
+    { factor: 1.0, eigs: nominalRaw },
+    ...upperSlices,
+  ];
+
+  // Assemble branch trajectories + compute logarithmic pole sensitivity S = |dλ / d(ln p)|
+  let globalMaxSens = 0;
+  const rawBranches = Array.from({ length: numBranches }, (_, bIdx) => {
+    const pts = orderedSlices.map((sl) => {
+      const e = sl.eigs[bIdx] ?? makeTrajectoryRawPole(0, 0);
+      return {
+        factor: sl.factor,
+        re: e.re,
+        im: e.im,
+        dampingRatio: e.dampingRatio,
+        naturalFreqRad: e.naturalFreqRad,
+        stable: e.stable,
+        sensitivity: 0,
+      };
+    });
+
+    for (let k = 0; k < pts.length; k++) {
+      const prevIdx = Math.max(0, k - 1);
+      const nextIdx = Math.min(pts.length - 1, k + 1);
+      const dLog = Math.log(pts[nextIdx].factor) - Math.log(pts[prevIdx].factor);
+      const dDist = Math.hypot(
+        pts[nextIdx].re - pts[prevIdx].re,
+        pts[nextIdx].im - pts[prevIdx].im
+      );
+      const sens = dLog > 1e-9 ? dDist / dLog : 0;
+      pts[k].sensitivity = sens;
+      if (sens > globalMaxSens) globalMaxSens = sens;
+    }
+
+    return pts;
+  });
+
+  const safeMaxSens = Math.max(globalMaxSens, 1e-9);
+  const branches: SensitivityBranch[] = rawBranches.map((pts, bIdx) => {
+    const normPts: SensitivityTrajectoryPoint[] = pts.map((pt) => ({
+      ...pt,
+      normSensitivity:
+        globalMaxSens > 1e-6 ? Math.min(1, pt.sensitivity / safeMaxSens) : 0,
+    }));
+
+    const sensitivities = normPts.map((p) => p.sensitivity);
+    const peakSensitivity =
+      sensitivities.length > 0 ? Math.max(...sensitivities) : 0;
+    const meanSensitivity =
+      sensitivities.length > 0
+        ? sensitivities.reduce((acc, s) => acc + s, 0) / sensitivities.length
+        : 0;
+    const res = normPts.map((p) => p.re);
+    const ims = normPts.map((p) => p.im);
+    const maxRealPart = res.length > 0 ? Math.max(...res) : 0;
+    const minRealPart = res.length > 0 ? Math.min(...res) : 0;
+    const realSpan = maxRealPart - minRealPart;
+    const imagSpan =
+      ims.length > 0 ? Math.max(...ims) - Math.min(...ims) : 0;
+
+    // Detect Re(s) = 0 stability boundary crossing
+    let criticalFactor: number | null = null;
+    for (let k = 0; k < normPts.length - 1; k++) {
+      const a = normPts[k];
+      const b = normPts[k + 1];
+      if ((a.re <= 0 && b.re > 0) || (a.re >= 0 && b.re < 0)) {
+        const denom = b.re - a.re;
+        const frac = Math.abs(denom) > 1e-12 ? (0 - a.re) / denom : 0.5;
+        criticalFactor = a.factor + frac * (b.factor - a.factor);
+        break;
+      }
+    }
+
+    const nom = nominalRaw[bIdx] ?? makeTrajectoryRawPole(0, 0);
+    return {
+      id: bIdx,
+      nominalPole: { re: nom.re, im: nom.im, stable: nom.stable },
+      points: normPts,
+      peakSensitivity,
+      meanSensitivity,
+      maxRealPart,
+      minRealPart,
+      realSpan,
+      imagSpan,
+      criticalFactor,
+    };
+  });
+
+  // Compute exact eigenvalues at activeFactor & match to branch sensitivities
+  const activeSliceNearestIdx = orderedSlices.reduce((bestIdx, sl, idx) => {
+    const bestDiff = Math.abs(orderedSlices[bestIdx].factor - activeFactor);
+    return Math.abs(sl.factor - activeFactor) < bestDiff ? idx : bestIdx;
+  }, 0);
+  const nearestSlice = orderedSlices[activeSliceNearestIdx];
+  const activeRawMatched =
+    Math.abs(activeFactor - 1.0) < 1e-4
+      ? nominalRaw
+      : matchEigenvalueOrder(nearestSlice.eigs, evalEigsAt(activeFactor));
+
+  const activePoles: SensitivityTrajectoryPoint[] = activeRawMatched.map(
+    (e, bIdx) => {
+      const branchPt =
+        branches[bIdx]?.points[activeSliceNearestIdx] ??
+        branches[bIdx]?.points[0];
+      const sens = branchPt?.sensitivity ?? 0;
+      return {
+        factor: activeFactor,
+        re: e.re,
+        im: e.im,
+        sensitivity: sens,
+        normSensitivity:
+          globalMaxSens > 1e-6 ? Math.min(1, sens / safeMaxSens) : 0,
+        dampingRatio: e.dampingRatio,
+        naturalFreqRad: e.naturalFreqRad,
+        stable: e.stable,
+      };
+    }
+  );
+
+  // Extract contiguous stable parameter multiplier interval [min, max]
+  let stableMin: number | null = null;
+  let stableMax: number | null = null;
+  for (let sIdx = 0; sIdx < orderedSlices.length; sIdx++) {
+    const f = orderedSlices[sIdx].factor;
+    const allStableAtSlice = branches.every(
+      (b) => (b.points[sIdx]?.re ?? 0) < -TOL
+    );
+    if (allStableAtSlice) {
+      if (stableMin === null) stableMin = f;
+      stableMax = f;
+    }
+  }
+
+  const nominalMaxRealPart =
+    nominalRaw.length > 0 ? Math.max(...nominalRaw.map((p) => p.re)) : 0;
+  const activeMaxRealPart =
+    activePoles.length > 0 ? Math.max(...activePoles.map((p) => p.re)) : 0;
+
+  return {
+    parameter: {
+      id: selected.id,
+      symbol: selected.symbol,
+      name: selected.name,
+      unit: selected.unit,
+      nominalDisplay: selected.nominalDisplay,
+      description: selected.description,
+    },
+    scope,
+    minFactor,
+    maxFactor,
+    activeFactor,
+    branches,
+    activePoles,
+    maxSensitivity: globalMaxSens,
+    nominalMaxRealPart,
+    activeMaxRealPart,
+    nominalStable: nominalMaxRealPart < -TOL,
+    activeStable: activeMaxRealPart < -TOL,
+    stableFactorRange: { min: stableMin, max: stableMax },
+  };
+}
+
 
 
 

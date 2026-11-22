@@ -1,7 +1,13 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Cable, Pause, Play, RefreshCw, StepForward } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Cable, Check, Copy, FileDown, Pause, Play, RefreshCw, StepForward } from 'lucide-react';
 import { ControlModel, HilConfig, HilFramePacket, SimulationTrace } from '../types/control';
-import { buildHilFrameStream, createHilPacket } from '../engine/hil';
+import {
+  buildHilFrameStream,
+  createHilPacket,
+  generateEsp32HilDeserializationCpp,
+  isHilCobsEnabled,
+} from '../engine/hil';
+import { exportTextFile } from '../utils/exportBundle';
 import { HilLatencyChart } from './HilLatencyChart';
 
 interface SerialPortInfo {
@@ -42,9 +48,40 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
   ]);
   const [selectedPortId, setSelectedPortId] = useState<string>('bridge://loopback-pty');
   const [bridgeStatusMsg, setBridgeStatusMsg] = useState<string | null>(null);
+  const [inspectorTab, setInspectorTab] = useState<'frame' | 'esp32_cpp'>('frame');
+  const [copiedCpp, setCopiedCpp] = useState(false);
   const [packets, setPackets] = useState<HilFramePacket[]>(() =>
     buildHilFrameStream(model, trace, { jitterMs: 1.2, packetDropPct: 4, seed: 42 })
   );
+
+  const cobsActive = isHilCobsEnabled(model);
+  const esp32RxCpp = useMemo(
+    () => generateEsp32HilDeserializationCpp(model, cobsActive),
+    [model, cobsActive]
+  );
+
+  const handleToggleCobsProtocol = () => {
+    const nextCobs = !cobsActive;
+    onChangeModel({
+      ...model,
+      hil: {
+        ...model.hil,
+        transport: 'uart_cobs',
+        baudOrRate: '921600 bps',
+        cobsEnabled: nextCobs,
+      },
+    });
+  };
+
+  const handleCopyCpp = async () => {
+    try {
+      await navigator.clipboard.writeText(esp32RxCpp);
+      setCopiedCpp(true);
+      window.setTimeout(() => setCopiedCpp(false), 1500);
+    } catch {
+      // Clipboard blocked; ignore gracefully
+    }
+  };
 
   const seqRef = useRef<number>(48);
   const sampleCursorRef = useRef<number>(0);
@@ -121,6 +158,7 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
               portId: selectedPortId,
               baudRate: 921600,
               transport: model.hil.transport,
+              cobsEnabled: cobsActive,
               wireHex: packet.wireHex,
             }),
           });
@@ -174,7 +212,8 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-4">
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Transport Selector */}
           <div className="flex items-center gap-1 p-0.5 bg-[#07090E] border border-slate-800 rounded">
             {TRANSPORTS.map((t) => (
               <button
@@ -183,10 +222,15 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
                 onClick={() =>
                   onChangeModel({
                     ...model,
-                    hil: { ...model.hil, transport: t.id, baudOrRate: t.rate },
+                    hil: {
+                      ...model.hil,
+                      transport: t.id,
+                      baudOrRate: t.rate,
+                      cobsEnabled: t.id === 'uart_cobs' ? cobsActive : false,
+                    },
                   })
                 }
-                className={`px-3 py-1 text-xs font-medium rounded transition-colors cursor-pointer whitespace-nowrap ${
+                className={`px-3 py-1 text-xs font-medium rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                   model.hil.transport === t.id
                     ? 'bg-slate-800 text-cyan-300'
                     : 'text-slate-400 hover:text-slate-200'
@@ -195,6 +239,27 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
                 {t.label}
               </button>
             ))}
+          </div>
+
+          {/* HIL Protocol (COBS Framing) Toggle */}
+          <div className="flex items-center gap-2 px-2.5 py-1 bg-[#07090E] border border-slate-800 rounded">
+            <span className="text-[11px] font-mono text-slate-400 whitespace-nowrap">
+              HIL Protocol
+            </span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={cobsActive}
+              aria-label="HIL Protocol COBS serial framing toggle"
+              onClick={handleToggleCobsProtocol}
+              className={`px-2.5 py-0.5 text-[11px] font-mono rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                cobsActive
+                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/50'
+                  : 'bg-slate-800 text-amber-300 border border-slate-700'
+              }`}
+            >
+              {cobsActive ? 'COBS + 0x00 ON' : 'Raw Binary'}
+            </button>
           </div>
 
           <button
@@ -461,66 +526,142 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
           </table>
         </div>
 
-        {/* Wire Frame Hex Breakdown */}
-        <div className="xl:col-span-5 bg-[#0B0E17] p-5 space-y-4">
-          {selectedPacket && (
-            <>
-              <div className="flex items-center justify-between">
-                <h3 className="text-xs font-semibold text-slate-200">
-                  Packet #{selectedPacket.seq} Binary Frame Inspector
-                </h3>
-                <span className="text-[11px] font-mono text-slate-400">
-                  {model.hil.transport.toUpperCase()} · {model.hil.baudOrRate}
-                </span>
-              </div>
+        {/* Wire Frame Hex Breakdown & ESP32 C++ Deserializer */}
+        <div className="xl:col-span-5 bg-[#0B0E17] p-5 space-y-4 flex flex-col min-w-0">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-1 p-0.5 bg-[#07090E] border border-slate-800 rounded">
+              <button
+                type="button"
+                onClick={() => setInspectorTab('frame')}
+                className={`px-2.5 py-1 text-[11px] font-mono rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  inspectorTab === 'frame'
+                    ? 'bg-slate-800 text-cyan-300'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Wire Frame Inspector
+              </button>
+              <button
+                type="button"
+                onClick={() => setInspectorTab('esp32_cpp')}
+                className={`px-2.5 py-1 text-[11px] font-mono rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  inspectorTab === 'esp32_cpp'
+                    ? 'bg-slate-800 text-cyan-300'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                ESP32 C++ Deserializer
+              </button>
+            </div>
 
-              <div className="grid grid-cols-2 gap-3 text-xs font-mono tabular-nums">
-                <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
-                  <div className="text-[10px] text-slate-500">ref</div>
-                  <div className="text-slate-100 mt-0.5">
-                    {selectedPacket.payloadFloats[0].toFixed(5)}
-                  </div>
-                </div>
-                <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
-                  <div className="text-[10px] text-slate-500">u_cmd</div>
-                  <div className="text-amber-300 mt-0.5">
-                    {selectedPacket.watchdogState === 'SAFE_CLAMP'
-                      ? `${model.hil.safeClampValue.toFixed(5)} (CLAMPED)`
-                      : selectedPacket.payloadFloats[3].toFixed(5)}
-                  </div>
-                </div>
-                <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
-                  <div className="text-[10px] text-slate-500">y[0]</div>
-                  <div className="text-cyan-300 mt-0.5">
-                    {selectedPacket.payloadFloats[1].toFixed(5)}
-                  </div>
-                </div>
-                <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
-                  <div className="text-[10px] text-slate-500">y[1]</div>
-                  <div className="text-cyan-300 mt-0.5">
-                    {selectedPacket.payloadFloats[2].toFixed(5)}
-                  </div>
-                </div>
+            {inspectorTab === 'esp32_cpp' ? (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    exportTextFile('esp32_hil_rx.hpp', esp32RxCpp, 'text/x-c++hdr;charset=utf-8')
+                  }
+                  className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono border border-slate-700 bg-[#07090E] hover:bg-slate-800 text-cyan-300 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <FileDown className="w-3 h-3" />
+                  Export .hpp
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCopyCpp}
+                  className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  {copiedCpp ? (
+                    <>
+                      <Check className="w-3 h-3 text-emerald-400" />
+                      Copied
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3 h-3" />
+                      Copy C++
+                    </>
+                  )}
+                </button>
               </div>
+            ) : (
+              <span className="text-[11px] font-mono text-slate-400">
+                {cobsActive ? 'COBS + CRC16' : 'RAW + CRC16'} · {model.hil.baudOrRate}
+              </span>
+            )}
+          </div>
 
-              <div>
-                <div className="text-[11px] font-mono text-slate-400 mb-1.5">
-                  Raw Payload (SOF 0xAA55 + SEQ + TICK_US + 4×f32 + CRC16)
-                </div>
-                <div className="p-3 rounded border border-slate-800 bg-[#07090E] text-[11px] font-mono text-slate-300 leading-5 break-all">
-                  {selectedPacket.rawHex}
-                </div>
+          {inspectorTab === 'esp32_cpp' ? (
+            <div className="flex-1 flex flex-col min-h-0 space-y-2.5">
+              <div className="text-[11px] text-slate-400 font-mono">
+                {cobsActive
+                  ? 'COBS byte-stuffing active: accumulates Serial bytes to 0x00 delimiter, runs hil_cobs_decode() + CRC-16 check, and feeds ctrl_step().'
+                  : 'COBS disabled: uses 0xAA 0x55 sliding header sync over unstuffed 28 B frames + CRC-16 check before ctrl_step().'}
               </div>
+              <pre className="flex-1 max-h-[340px] p-3.5 rounded border border-slate-800 bg-[#07090E] text-[11px] font-mono leading-5 text-slate-200 overflow-auto">
+                <code>{esp32RxCpp}</code>
+              </pre>
+            </div>
+          ) : (
+            selectedPacket && (
+              <>
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-semibold text-slate-200">
+                    Packet #{selectedPacket.seq} Binary Frame Breakdown
+                  </h3>
+                  <span className="text-[11px] font-mono tabular-nums text-slate-400">
+                    {selectedPacket.byteLength} B on wire
+                  </span>
+                </div>
 
-              <div>
-                <div className="text-[11px] font-mono text-slate-400 mb-1.5">
-                  Wire Frame ({model.hil.transport === 'uart_cobs' ? 'COBS + 0x00 Delimiter' : 'Native Frame'})
+                <div className="grid grid-cols-2 gap-3 text-xs font-mono tabular-nums">
+                  <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+                    <div className="text-[10px] text-slate-500">ref</div>
+                    <div className="text-slate-100 mt-0.5">
+                      {selectedPacket.payloadFloats[0].toFixed(5)}
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+                    <div className="text-[10px] text-slate-500">u_cmd</div>
+                    <div className="text-amber-300 mt-0.5">
+                      {selectedPacket.watchdogState === 'SAFE_CLAMP'
+                        ? `${model.hil.safeClampValue.toFixed(5)} (CLAMPED)`
+                        : selectedPacket.payloadFloats[3].toFixed(5)}
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+                    <div className="text-[10px] text-slate-500">y[0]</div>
+                    <div className="text-cyan-300 mt-0.5">
+                      {selectedPacket.payloadFloats[1].toFixed(5)}
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+                    <div className="text-[10px] text-slate-500">y[1]</div>
+                    <div className="text-cyan-300 mt-0.5">
+                      {selectedPacket.payloadFloats[2].toFixed(5)}
+                    </div>
+                  </div>
                 </div>
-                <div className="p-3 rounded border border-slate-800 bg-[#07090E] text-[11px] font-mono text-cyan-300 leading-5 break-all">
-                  {selectedPacket.wireHex}
+
+                <div>
+                  <div className="text-[11px] font-mono text-slate-400 mb-1.5">
+                    Raw Payload (SOF 0xAA55 + SEQ + TICK_US + 4×f32 + CRC16)
+                  </div>
+                  <div className="p-3 rounded border border-slate-800 bg-[#07090E] text-[11px] font-mono text-slate-300 leading-5 break-all">
+                    {selectedPacket.rawHex}
+                  </div>
                 </div>
-              </div>
-            </>
+
+                <div>
+                  <div className="text-[11px] font-mono text-slate-400 mb-1.5">
+                    Wire Frame ({cobsActive ? 'COBS Stuffed + 0x00 Delimiter' : 'Raw Unstuffed Serial Frame'})
+                  </div>
+                  <div className="p-3 rounded border border-slate-800 bg-[#07090E] text-[11px] font-mono text-cyan-300 leading-5 break-all">
+                    {selectedPacket.wireHex}
+                  </div>
+                </div>
+              </>
+            )
           )}
         </div>
       </div>

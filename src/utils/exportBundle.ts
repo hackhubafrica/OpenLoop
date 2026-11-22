@@ -1,5 +1,10 @@
 import { ControlModel, DiscretizedMatrices } from '../types/control';
 import { generateEmbeddedCode } from '../engine/codegen';
+import {
+  DEFAULT_ESP32_PIN_PROFILE,
+  Esp32PinProfile,
+  generateEsp32PlatformIoBundle,
+} from '../engine/esp32Codegen';
 import { serializeModelToToml } from '../engine/ir';
 
 // CRC-32 lookup table for valid standard ZIP archives
@@ -142,6 +147,12 @@ export function exportProjectBundle(
   const code = generateEmbeddedCode(model, discrete);
   const toml = serializeModelToToml(model);
 
+  const pio = generateEsp32PlatformIoBundle(
+    model,
+    discrete,
+    DEFAULT_ESP32_PIN_PROFILE
+  );
+
   const readme = `# OpenLoop Export Bundle — ${model.name}
 
 License: ${model.license}
@@ -149,14 +160,18 @@ Fixed Step (dt): ${model.baseDt} s (${Math.round(1 / model.baseDt)} Hz)
 Discretization: ${discrete.method.toUpperCase()}
 
 ## Included Files
-- model.ctrl.toml : Declarative Git-friendly control model IR
-- ctrl_model.h    : Zero-allocation C99 public API & state struct
-- ctrl_model.c    : Deterministic C99 fixed-step implementation
-- lib.rs          : Standalone #![no_std] Rust controller crate
-- hil_frame.h     : COBS + CRC-16-CCITT HIL binary framing helpers
+- model.ctrl.toml                : Declarative Git-friendly control model IR
+- ctrl_model.h                   : Zero-allocation C99 public API & state struct
+- ctrl_model.c                   : Deterministic C99 fixed-step implementation
+- lib.rs                         : Standalone #![no_std] Rust controller crate
+- hil_frame.h                    : COBS + CRC-16-CCITT HIL binary framing helpers
+- esp32_platformio/              : Ready-to-flash PlatformIO ESP32 Arduino workspace
 
 ## Quick Build (C99 Host SIL Check)
 cc -std=c99 -Wall -Wextra -Werror -c ctrl_model.c -o ctrl_model.o
+
+## Quick Build (PlatformIO ESP32)
+cd esp32_platformio && pio run -t upload
 
 ## Quick Build (no_std Rust)
 rustc --crate-type lib --edition 2021 lib.rs -O
@@ -168,6 +183,12 @@ rustc --crate-type lib --edition 2021 lib.rs -O
     { name: 'c99/ctrl_model.c', content: code.cSource },
     { name: 'c99/hil_frame.h', content: code.hilHeader },
     { name: 'rust_nostd/src/lib.rs', content: code.rustLib },
+    { name: 'esp32_platformio/platformio.ini', content: pio.platformioIni },
+    { name: 'esp32_platformio/include/ctrl_model.h', content: code.cHeader },
+    { name: 'esp32_platformio/include/hil_frame.h', content: code.hilHeader },
+    { name: 'esp32_platformio/src/ctrl_model.c', content: code.cSource },
+    { name: 'esp32_platformio/src/main.cpp', content: pio.mainCpp },
+    { name: 'esp32_platformio/WIRING.md', content: pio.wiringMarkdown },
     { name: 'README.md', content: readme },
   ]);
 
@@ -288,4 +309,44 @@ export function saveModelAsJson(model: ControlModel): void {
   const json = serializeModelToJson(model);
   const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
   triggerDownload(blob, `openloop-${model.id}.ctrl.json`);
+}
+
+export function buildEsp32PlatformIoZipEntries(
+  model: ControlModel,
+  discrete: DiscretizedMatrices,
+  profile: Esp32PinProfile = DEFAULT_ESP32_PIN_PROFILE
+): ZipEntry[] {
+  const code = generateEmbeddedCode(model, discrete);
+  const pio = generateEsp32PlatformIoBundle(model, discrete, profile);
+  const toml = serializeModelToToml(model);
+  const root = `openloop-${model.id}-esp32-pio`;
+
+  return [
+    { name: `${root}/platformio.ini`, content: pio.platformioIni },
+    { name: `${root}/include/ctrl_model.h`, content: code.cHeader },
+    { name: `${root}/include/hil_frame.h`, content: code.hilHeader },
+    { name: `${root}/src/ctrl_model.c`, content: code.cSource },
+    { name: `${root}/src/main.cpp`, content: pio.mainCpp },
+    { name: `${root}/model.ctrl.toml`, content: toml },
+    { name: `${root}/WIRING.md`, content: pio.wiringMarkdown },
+  ];
+}
+
+export function exportEsp32PlatformIoZip(
+  model: ControlModel,
+  discrete: DiscretizedMatrices,
+  profile: Esp32PinProfile = DEFAULT_ESP32_PIN_PROFILE
+): void {
+  const entries = buildEsp32PlatformIoZipEntries(model, discrete, profile);
+  const blob = buildZipBlob(entries);
+  triggerDownload(blob, `openloop-${model.id}-${profile.boardEnv}-pio.zip`);
+}
+
+export function exportTextFile(
+  filename: string,
+  content: string,
+  mimeType: string = 'text/plain;charset=utf-8'
+): void {
+  const blob = new Blob([content], { type: mimeType });
+  triggerDownload(blob, filename);
 }

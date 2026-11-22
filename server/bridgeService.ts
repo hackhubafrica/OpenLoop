@@ -46,6 +46,7 @@ export interface HilProbeRequest {
   portId: string;
   baudRate: number;
   transport: 'uart_cobs' | 'socketcan' | 'udp';
+  cobsEnabled?: boolean;
   wireHex: string;
 }
 
@@ -122,7 +123,7 @@ function cobsDecode(encoded: Uint8Array): Uint8Array | null {
 
 function decodeHilFrame(
   wireBytes: Uint8Array,
-  transport: HilProbeRequest['transport']
+  useCobs: boolean
 ): {
   rawPayload: Uint8Array | null;
   crcValid: boolean;
@@ -130,7 +131,7 @@ function decodeHilFrame(
   tickUs: number | null;
   computedCrc: number | null;
 } {
-  const rawPayload = transport === 'uart_cobs' ? cobsDecode(wireBytes) : wireBytes;
+  const rawPayload = useCobs ? cobsDecode(wireBytes) : wireBytes;
   if (!rawPayload || rawPayload.length < 28) {
     return {
       rawPayload,
@@ -513,7 +514,8 @@ export async function probeHilBridge(req: HilProbeRequest): Promise<HilProbeResp
     })
   );
 
-  const txDecoded = decodeHilFrame(wireBytes, req.transport);
+  const useCobs = req.cobsEnabled ?? req.transport === 'uart_cobs';
+  const txDecoded = decodeHilFrame(wireBytes, useCobs);
 
   if (!txDecoded.rawPayload || txDecoded.rawPayload.length < 28) {
     return {
@@ -545,7 +547,7 @@ export async function probeHilBridge(req: HilProbeRequest): Promise<HilProbeResp
     try {
       const echoed = await exchangeSerialFrame(matchedPort.id, req.baudRate, wireBytes);
       if (echoed.length > 0) {
-        const rxDecoded = decodeHilFrame(echoed, req.transport);
+        const rxDecoded = decodeHilFrame(echoed, useCobs);
         return {
           ok: rxDecoded.crcValid,
           portId: matchedPort.id,

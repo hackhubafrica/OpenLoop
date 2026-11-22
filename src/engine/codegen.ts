@@ -526,6 +526,25 @@ static inline size_t hil_cobs_encode(const uint8_t *in, size_t len, uint8_t *out
     return write_idx;
 }
 
+static inline size_t hil_cobs_decode(const uint8_t *in, size_t len, uint8_t *out, size_t max_out) {
+    if ((in == NULL) || (out == NULL) || (len < 2U)) { return 0U; }
+    size_t end = (in[len - 1U] == 0x00U) ? (len - 1U) : len;
+    size_t read_idx = 0U, write_idx = 0U;
+    while (read_idx < end) {
+        uint8_t code = in[read_idx++];
+        if (code == 0x00U) { return 0U; }
+        for (uint8_t i = 1U; i < code; ++i) {
+            if ((read_idx >= end) || (write_idx >= max_out)) { return 0U; }
+            out[write_idx++] = in[read_idx++];
+        }
+        if ((code < 0xFFU) && (read_idx < end)) {
+            if (write_idx >= max_out) { return 0U; }
+            out[write_idx++] = 0x00U;
+        }
+    }
+    return write_idx;
+}
+
 #endif /* OPENLOOP_HIL_FRAME_H */
 `;
 

@@ -135,6 +135,7 @@ export function createBridgeRouter(options: BridgeRouterOptions = {}): Router {
         portId: body.portId,
         baudRate: body.baudRate,
         transport: body.transport,
+        cobsEnabled: typeof body.cobsEnabled === 'boolean' ? body.cobsEnabled : undefined,
         wireHex: body.wireHex,
       });
       res.json(result);

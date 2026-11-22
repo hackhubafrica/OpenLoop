@@ -4,8 +4,10 @@ import { ControlModel } from '../types/control';
 import {
   analyzeSystemStability,
   ComplexPoleZero,
+  computeSPlaneStabilityHeatmap,
   RootLocusAnalysis,
   RootLocusPoint,
+  SPlaneHeatmapCell,
 } from '../engine/stability';
 
 interface PoleZeroPlotProps {
@@ -40,6 +42,11 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
   const [outputIdx, setOutputIdx] = useState<number>(model.pid.targetOutputIndex);
   const [hovered, setHovered] = useState<ComplexPoleZero | null>(null);
   const [hoveredLocus, setHoveredLocus] = useState<RootLocusPoint | null>(null);
+  const [showStabilityHeatmap, setShowStabilityHeatmap] = useState<boolean>(false);
+  const [gainScale, setGainScale] = useState<number>(1.0);
+  const [maxTimeConstantSec, setMaxTimeConstantSec] = useState<number>(1.0);
+  const [minDampingRatio, setMinDampingRatio] = useState<number>(0.2);
+  const [hoveredCell, setHoveredCell] = useState<SPlaneHeatmapCell | null>(null);
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   const scalesRef = useRef<{
@@ -105,6 +112,26 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
       ? analysis.closedLoopVerdict
       : analysis.openLoopVerdict;
 
+  const heatmapSummary = useMemo(() => {
+    if (!showStabilityHeatmap || plane !== 's') return null;
+    return computeSPlaneStabilityHeatmap(model, [-4, 1], [-4, 4], {
+      scope: loopMode,
+      gainScale,
+      maxTimeConstantSec,
+      minDampingRatio,
+      cols: 6,
+      rows: 4,
+    });
+  }, [
+    showStabilityHeatmap,
+    plane,
+    model,
+    loopMode,
+    gainScale,
+    maxTimeConstantSec,
+    minDampingRatio,
+  ]);
+
   useEffect(() => {
     const svgEl = svgRef.current;
     if (!svgEl) return;
@@ -148,6 +175,9 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
         ...allMarkers.map((p) => p.im),
         ...locusPoints.map((p) => p.im),
       ];
+      if (showStabilityHeatmap) {
+        reals.push(-1 / Math.max(0.02, maxTimeConstantSec));
+      }
       const minRe = Math.min(-2, ...reals, 0);
       const maxRe = Math.max(1, ...reals, 0);
       const spanRe = Math.max(2, maxRe - minRe);
@@ -161,6 +191,50 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
     const xScale = d3.scaleLinear().domain(xDomain).range([0, innerW]);
     const yScale = d3.scaleLinear().domain(yDomain).range([innerH, 0]);
     scalesRef.current = { xScale, yScale, innerW, innerH };
+
+    const activeHeatmap =
+      plane === 's' && showStabilityHeatmap
+        ? computeSPlaneStabilityHeatmap(model, xDomain, yDomain, {
+            scope: loopMode,
+            gainScale,
+            maxTimeConstantSec,
+            minDampingRatio,
+            cols: 44,
+            rows: 26,
+          })
+        : null;
+
+    // Interactive Stability Margin Heatmap Layer (rendered underneath grid & poles)
+    if (activeHeatmap) {
+      const cellW = innerW / activeHeatmap.cols;
+      const cellH = innerH / activeHeatmap.rows;
+
+      const colorForScore = (score: number, inRegion: boolean): string => {
+        if (score >= 0) {
+          if (inRegion) {
+            return d3.interpolateRgb('#0891B2', '#10B981')(Math.min(1, score));
+          }
+          return d3.interpolateRgb('#B45309', '#06B6D4')(Math.min(1, score * 1.4));
+        }
+        return d3.interpolateRgb('#D97706', '#9F1239')(Math.min(1, Math.abs(score)));
+      };
+
+      const heatGroup = g.append('g').attr('class', 'pz-stability-heatmap');
+      heatGroup
+        .selectAll('rect')
+        .data(activeHeatmap.cells)
+        .join('rect')
+        .attr('x', (_, idx) => (idx % activeHeatmap.cols) * cellW)
+        .attr('y', (_, idx) => Math.floor(idx / activeHeatmap.cols) * cellH)
+        .attr('width', cellW + 0.6)
+        .attr('height', cellH + 0.6)
+        .attr('fill', (d) => colorForScore(d.marginScore, d.inStableRegion))
+        .attr('fill-opacity', (d) =>
+          d.inStableRegion
+            ? 0.22 + 0.34 * Math.max(0, d.marginScore)
+            : 0.14 + 0.28 * Math.min(1, Math.abs(d.marginScore))
+        );
+    }
 
     // Grid lines
     g.append('g')
@@ -245,6 +319,50 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
         .attr('font-size', '9px')
         .attr('font-family', 'IBM Plex Mono, monospace')
         .text('RHP Unstable (Re > 0)');
+
+      // Target Time-Constant & Minimum Damping Spec Boundaries when Heatmap Active
+      if (showStabilityHeatmap) {
+        const sigmaReq = -1 / Math.max(0.02, maxTimeConstantSec);
+        const xTau = xScale(sigmaReq);
+        if (xTau >= 0 && xTau <= innerW) {
+          g.append('line')
+            .attr('x1', xTau)
+            .attr('x2', xTau)
+            .attr('y1', 0)
+            .attr('y2', innerH)
+            .attr('stroke', '#34D399')
+            .attr('stroke-opacity', 0.85)
+            .attr('stroke-dasharray', '5 3')
+            .attr('stroke-width', 1.4);
+
+          g.append('text')
+            .attr('x', Math.max(6, xTau - 6))
+            .attr('y', innerH - 6)
+            .attr('text-anchor', 'end')
+            .attr('fill', '#6EE7B7')
+            .attr('font-size', '9px')
+            .attr('font-family', 'IBM Plex Mono, monospace')
+            .text(`τ≤${maxTimeConstantSec.toFixed(2)}s (σ=${sigmaReq.toFixed(2)})`);
+        }
+
+        if (minDampingRatio > 0.01 && minDampingRatio < 0.99) {
+          const dampAngle = Math.acos(minDampingRatio);
+          const rayLen = Math.max(Math.abs(xDomain[0]), yDomain[1]) * 1.4;
+          const endRe = -rayLen * Math.cos(dampAngle);
+          const endIm = rayLen * Math.sin(dampAngle);
+          for (const sgn of [1, -1]) {
+            g.append('line')
+              .attr('x1', originX)
+              .attr('y1', originY)
+              .attr('x2', xScale(endRe))
+              .attr('y2', yScale(sgn * endIm))
+              .attr('stroke', '#22D3EE')
+              .attr('stroke-opacity', 0.65)
+              .attr('stroke-dasharray', '3 3')
+              .attr('stroke-width', 1.2);
+          }
+        }
+      }
     } else {
       // z-plane axes + unit circle
       g.append('line')
@@ -379,6 +497,34 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
         .attr('stroke-width', 2);
     }
 
+    // Plot Scaled Controller Poles (diamonds) when Gain Multiplier != 1.0 under Stability Margin overlay
+    if (
+      plane === 's' &&
+      showStabilityHeatmap &&
+      loopMode === 'closed' &&
+      Math.abs(gainScale - 1.0) > 1e-3
+    ) {
+      const scaledStats = computeSPlaneStabilityHeatmap(model, xDomain, yDomain, {
+        scope: 'closed',
+        gainScale,
+        maxTimeConstantSec,
+        minDampingRatio,
+        cols: 4,
+        rows: 4,
+      });
+      for (const sp of scaledStats.scaledPoles) {
+        const cx = xScale(sp.re);
+        const cy = yScale(sp.im);
+        if (cx < -10 || cx > innerW + 10 || cy < -10 || cy > innerH + 10) continue;
+        const fill = sp.re < -1e-6 ? '#34D399' : '#FB7185';
+        g.append('path')
+          .attr('d', `M ${cx} ${cy - 5} L ${cx + 5} ${cy} L ${cx} ${cy + 5} L ${cx - 5} ${cy} Z`)
+          .attr('fill', fill)
+          .attr('stroke', '#07090E')
+          .attr('stroke-width', 1.2);
+      }
+    }
+
     // Axes ticks
     const xAxis = d3.axisBottom(xScale).ticks(7).tickSizeOuter(0);
     const yAxis = d3.axisLeft(yScale).ticks(5).tickSizeOuter(0);
@@ -444,6 +590,7 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
         if (best) {
           setHovered(best);
           setHoveredLocus(null);
+          setHoveredCell(null);
           return;
         }
         setHovered(null);
@@ -461,13 +608,35 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
             }
           }
           setHoveredLocus(bestLocus);
+          if (bestLocus) {
+            setHoveredCell(null);
+            return;
+          }
         } else {
           setHoveredLocus(null);
+        }
+
+        if (activeHeatmap) {
+          const re = xScale.invert(mx);
+          const im = yScale.invert(my);
+          let nearestCell: SPlaneHeatmapCell | null = null;
+          let nearestDist = Infinity;
+          for (const cell of activeHeatmap.cells) {
+            const d = Math.hypot(cell.re - re, cell.im - im);
+            if (d < nearestDist) {
+              nearestDist = d;
+              nearestCell = cell;
+            }
+          }
+          setHoveredCell(nearestCell);
+        } else {
+          setHoveredCell(null);
         }
       })
       .on('pointerleave', () => {
         setHovered(null);
         setHoveredLocus(null);
+        setHoveredCell(null);
       });
   }, [
     plane,
@@ -477,6 +646,11 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
     activeZeros,
     analysis.openLoopPoles,
     rootLocus,
+    showStabilityHeatmap,
+    gainScale,
+    maxTimeConstantSec,
+    minDampingRatio,
+    model,
   ]);
 
   // Lightweight hover ring + crosshair overlay update without tearing down the SVG
@@ -636,6 +810,26 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
               ))}
             </select>
           )}
+
+          <button
+            type="button"
+            aria-pressed={showStabilityHeatmap && plane === 's'}
+            onClick={() => {
+              const next = !showStabilityHeatmap;
+              setShowStabilityHeatmap(next);
+              if (next) {
+                setPlane('s');
+                setLoopMode('closed');
+              }
+            }}
+            className={`px-2.5 py-1 text-[11px] font-mono rounded border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+              showStabilityHeatmap && plane === 's'
+                ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                : 'border-slate-700 bg-[#07090E] text-slate-300 hover:border-slate-600 hover:text-slate-100'
+            }`}
+          >
+            Stability Margin
+          </button>
         </div>
 
         <div className="flex flex-wrap items-center gap-4 text-xs font-mono tabular-nums">
@@ -671,13 +865,35 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
                 ? ` · ζ=${hovered.dampingRatio.toFixed(3)} · ωn=${hovered.naturalFreqRad.toFixed(2)}`
                 : ` · |z|=${hovered.mag.toFixed(5)}`}
             </span>
+          ) : hoveredLocus ? (
+            <span className="text-[11px] text-sky-300 pl-3 border-l border-slate-800">
+              Locus (K={hoveredLocus.k < 10 ? hoveredLocus.k.toFixed(2) : hoveredLocus.k.toFixed(1)}):{' '}
+              {Math.abs(hoveredLocus.im) < 1e-5
+                ? hoveredLocus.re.toFixed(3)
+                : `${hoveredLocus.re.toFixed(3)} ${hoveredLocus.im >= 0 ? '+' : '-'} j${Math.abs(hoveredLocus.im).toFixed(3)}`}
+            </span>
           ) : (
-            hoveredLocus && (
-              <span className="text-[11px] text-sky-300 pl-3 border-l border-slate-800">
-                Locus (K={hoveredLocus.k < 10 ? hoveredLocus.k.toFixed(2) : hoveredLocus.k.toFixed(1)}):{' '}
-                {Math.abs(hoveredLocus.im) < 1e-5
-                  ? hoveredLocus.re.toFixed(3)
-                  : `${hoveredLocus.re.toFixed(3)} ${hoveredLocus.im >= 0 ? '+' : '-'} j${Math.abs(hoveredLocus.im).toFixed(3)}`}
+            hoveredCell &&
+            showStabilityHeatmap &&
+            plane === 's' && (
+              <span className="text-[11px] text-slate-200 pl-3 border-l border-slate-800">
+                s={hoveredCell.re.toFixed(2)}
+                {hoveredCell.im >= 0 ? '+' : '-'}j{Math.abs(hoveredCell.im).toFixed(2)} · τ=
+                {hoveredCell.timeConstantSec !== null
+                  ? `${hoveredCell.timeConstantSec.toFixed(2)}s`
+                  : '∞'}{' '}
+                · ζ={hoveredCell.dampingRatio.toFixed(2)} · Margin{' '}
+                <span
+                  className={
+                    hoveredCell.inStableRegion
+                      ? 'text-emerald-400'
+                      : hoveredCell.re < 0
+                      ? 'text-amber-300'
+                      : 'text-rose-400'
+                  }
+                >
+                  {(hoveredCell.marginScore * 100).toFixed(0)}%
+                </span>
               </span>
             )
           )}
@@ -693,6 +909,108 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
           )}
         </div>
       </div>
+
+      {/* Interactive Stability Margin Heatmap Controls */}
+      {showStabilityHeatmap && plane === 's' && heatmapSummary && (
+        <div
+          aria-label="Stability Margin s-plane parameter controls"
+          className="px-5 py-2 border-b border-slate-800 bg-[#0B0E17] flex flex-wrap items-center justify-between gap-4 text-[11px] font-mono tabular-nums"
+        >
+          <div className="flex flex-wrap items-center gap-4">
+            <label className="flex items-center gap-2 text-slate-300">
+              <span className="text-slate-400 whitespace-nowrap">Gain Scale K/K₀</span>
+              <input
+                aria-label="Gain scale multiplier"
+                type="range"
+                min={0.1}
+                max={4.0}
+                step={0.05}
+                value={gainScale}
+                onChange={(e) => setGainScale(Number(e.target.value))}
+                className="w-24 h-1.5 bg-slate-800 rounded accent-emerald-400 cursor-pointer"
+              />
+              <span className="text-emerald-300 w-10 text-right">
+                {gainScale.toFixed(2)}×
+              </span>
+              {Math.abs(gainScale - 1.0) > 1e-3 && (
+                <button
+                  type="button"
+                  onClick={() => setGainScale(1.0)}
+                  className="px-1.5 py-0.5 text-[10px] border border-slate-700 rounded text-slate-400 hover:text-slate-200 cursor-pointer"
+                >
+                  1×
+                </button>
+              )}
+            </label>
+
+            <label className="flex items-center gap-2 text-slate-300">
+              <span className="text-slate-400 whitespace-nowrap">Target τ_max</span>
+              <input
+                aria-label="Target maximum time constant tau"
+                type="range"
+                min={0.05}
+                max={3.0}
+                step={0.05}
+                value={maxTimeConstantSec}
+                onChange={(e) => setMaxTimeConstantSec(Number(e.target.value))}
+                className="w-24 h-1.5 bg-slate-800 rounded accent-cyan-400 cursor-pointer"
+              />
+              <span className="text-cyan-300 w-11 text-right">
+                {maxTimeConstantSec.toFixed(2)}s
+              </span>
+            </label>
+
+            <div className="flex items-center gap-1">
+              <span className="text-slate-400 mr-1">Min ζ</span>
+              {[0, 0.2, 0.5, 0.707].map((zetaVal) => (
+                <button
+                  key={zetaVal}
+                  type="button"
+                  onClick={() => setMinDampingRatio(zetaVal)}
+                  className={`px-1.5 py-0.5 text-[10px] rounded border transition-colors cursor-pointer ${
+                    Math.abs(minDampingRatio - zetaVal) < 0.01
+                      ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-200'
+                      : 'border-slate-800 bg-[#07090E] text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {zetaVal}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 text-[10.5px]">
+            <span className="text-slate-400">
+              Stable Gain K:{' '}
+              <span className="text-emerald-300 font-semibold">
+                {heatmapSummary.stableGainRange.min !== null &&
+                heatmapSummary.stableGainRange.max !== null
+                  ? `[${heatmapSummary.stableGainRange.min.toFixed(2)}×, ${heatmapSummary.stableGainRange.max.toFixed(2)}×]`
+                  : 'None in [0.05×, 8×]'}
+              </span>
+            </span>
+            <span className="text-slate-600" aria-hidden="true">
+              ·
+            </span>
+            <span className="text-slate-400">
+              Dom τ:{' '}
+              <span
+                className={
+                  heatmapSummary.meetsTimeConstantSpec
+                    ? 'text-emerald-300 font-semibold'
+                    : heatmapSummary.activeSystemStable
+                    ? 'text-amber-300 font-semibold'
+                    : 'text-rose-400 font-semibold'
+                }
+              >
+                {heatmapSummary.dominantTimeConstantSec !== null
+                  ? `${heatmapSummary.dominantTimeConstantSec.toFixed(3)}s`
+                  : 'Unstable'}
+              </span>
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Complex Plane Legend */}
       <div className="px-5 pt-2.5 flex flex-wrap items-center justify-between gap-3 text-[10px] font-mono text-slate-400">
@@ -750,6 +1068,27 @@ export const PoleZeroPlot: React.FC<PoleZeroPlotProps> = ({
           className="w-full h-[270px] select-none"
         />
       </div>
+
+      {/* Heatmap Color Scale Legend */}
+      {showStabilityHeatmap && plane === 's' && (
+        <div className="px-5 pb-2.5 flex flex-wrap items-center justify-between gap-3 text-[10px] font-mono text-slate-400">
+          <div className="flex items-center gap-2">
+            <span className="text-rose-400">−100% Unstable (RHP)</span>
+            <div
+              aria-hidden="true"
+              className="w-36 h-2 rounded-sm border border-slate-800"
+              style={{
+                background:
+                  'linear-gradient(90deg, #9F1239 0%, #F43F5E 28%, #D97706 48%, #0891B2 68%, #10B981 100%)',
+              }}
+            />
+            <span className="text-emerald-400">+100% Stable Region (τ ≤ τ_max)</span>
+          </div>
+          <span className="text-slate-500">
+            Hover any s-plane coordinate for local time constant τ = −1/σ &amp; margin
+          </span>
+        </div>
+      )}
 
       {/* Eigenvalue & Zero Table */}
       <div className="px-5 pb-4">
