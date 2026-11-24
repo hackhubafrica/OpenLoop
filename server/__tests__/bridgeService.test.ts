@@ -137,6 +137,67 @@ describe('Local Node Bridge Service & Express Router', () => {
       };
       expect(verifyData.ok).toBe(true);
       expect(verifyData.c99.status).toBe('passed');
+
+      const espStatusRes = await fetch(`${baseUrl}/esp32/status`);
+      expect(espStatusRes.status).toBe(200);
+      const espStatus = (await espStatusRes.json()) as {
+        ok: boolean;
+        pioAvailable: boolean;
+        ports: { id: string }[];
+      };
+      expect(espStatus.ok).toBe(true);
+      expect(typeof espStatus.pioAvailable).toBe('boolean');
+      expect(Array.isArray(espStatus.ports)).toBe(true);
+
+      const badEnvRes = await fetch(`${baseUrl}/esp32/build`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          boardEnv: 'esp32dev; rm -rf /',
+          platformioIni: '[env:esp32dev]',
+          mainCpp: 'void setup() {} void loop() {}',
+          cHeader: code.cHeader,
+          cSource: code.cSource,
+          hilHeader: code.hilHeader,
+        }),
+      });
+      expect(badEnvRes.status).toBe(400);
+
+      const validBuildRes = await fetch(`${baseUrl}/esp32/build`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          boardEnv: 'esp32dev',
+          platformioIni: '[env:esp32dev]\nplatform = espressif32\nboard = esp32dev\nframework = arduino\n',
+          mainCpp: '#include <Arduino.h>\nvoid setup() {}\nvoid loop() {}\n',
+          cHeader: code.cHeader,
+          cSource: code.cSource,
+          hilHeader: code.hilHeader,
+        }),
+      });
+      expect(validBuildRes.status).toBe(200);
+      const validBuildData = (await validBuildRes.json()) as {
+        ok: boolean;
+        boardEnv: string;
+        pioCommand: string;
+      };
+      expect(validBuildData.boardEnv).toBe('esp32dev');
+      expect(validBuildData.pioCommand).toContain('esp32dev');
+
+      const loopbackFlashRes = await fetch(`${baseUrl}/esp32/flash`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          portId: 'bridge://loopback-pty',
+          boardEnv: 'esp32dev',
+          platformioIni: '[env:esp32dev]',
+          mainCpp: 'void setup() {} void loop() {}',
+          cHeader: code.cHeader,
+          cSource: code.cSource,
+          hilHeader: code.hilHeader,
+        }),
+      });
+      expect(loopbackFlashRes.status).toBe(400);
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));

@@ -166,10 +166,12 @@ describe('ESP32 Plant Templates & PlatformIO Firmware Codegen', () => {
       'openloop-esp32_ultrasonic_hold-esp32-pio/platformio.ini',
       'openloop-esp32_ultrasonic_hold-esp32-pio/include/ctrl_model.h',
       'openloop-esp32_ultrasonic_hold-esp32-pio/include/hil_frame.h',
+      'openloop-esp32_ultrasonic_hold-esp32-pio/include/esp32_hil_rx.hpp',
       'openloop-esp32_ultrasonic_hold-esp32-pio/src/ctrl_model.c',
       'openloop-esp32_ultrasonic_hold-esp32-pio/src/main.cpp',
       'openloop-esp32_ultrasonic_hold-esp32-pio/model.ctrl.toml',
       'openloop-esp32_ultrasonic_hold-esp32-pio/WIRING.md',
+      'openloop-esp32_ultrasonic_hold-esp32-pio/README.md',
     ]);
   });
 

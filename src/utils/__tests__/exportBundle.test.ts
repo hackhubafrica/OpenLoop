@@ -3,6 +3,7 @@ import { PRESET_MODELS } from '../../data/presets';
 import { discretizeStateSpace } from '../../engine/math';
 import { computeRootLocus } from '../../engine/stability';
 import {
+  buildEsp32PlatformIoZipEntries,
   buildPresetZipEntries,
   buildZipBytes,
   crc32,
@@ -122,5 +123,38 @@ describe('Preset ZIP Packaging & Export Utilities', () => {
 
     expect(closedPdf.bytes.length).toBeGreaterThan(2500);
     expect(closedPdf.doc.getNumberOfPages()).toBeGreaterThanOrEqual(2);
+  });
+
+  it('packages Generate PlatformIO Project ZIP with platformio.ini, C99 control loop, and ESP32 HIL RX header', () => {
+    const model = PRESET_MODELS.pendulum;
+    const discrete = discretizeStateSpace(
+      model.plant,
+      model.baseDt,
+      model.discretization
+    );
+
+    const entries = buildEsp32PlatformIoZipEntries(model, discrete);
+    const names = entries.map((e) => e.name);
+
+    expect(names).toEqual([
+      'openloop-pendulum-esp32-pio/platformio.ini',
+      'openloop-pendulum-esp32-pio/include/ctrl_model.h',
+      'openloop-pendulum-esp32-pio/include/hil_frame.h',
+      'openloop-pendulum-esp32-pio/include/esp32_hil_rx.hpp',
+      'openloop-pendulum-esp32-pio/src/ctrl_model.c',
+      'openloop-pendulum-esp32-pio/src/main.cpp',
+      'openloop-pendulum-esp32-pio/model.ctrl.toml',
+      'openloop-pendulum-esp32-pio/WIRING.md',
+      'openloop-pendulum-esp32-pio/README.md',
+    ]);
+
+    const hilRx = entries.find((e) => e.name.endsWith('esp32_hil_rx.hpp'));
+    expect(hilRx?.content).toContain('HilCobsSerialReceiver');
+    const cSrc = entries.find((e) => e.name.endsWith('ctrl_model.c'));
+    expect(cSrc?.content).toContain('void ctrl_step(');
+
+    const zipBytes = buildZipBytes(entries);
+    const view = new DataView(zipBytes.buffer, zipBytes.byteOffset, zipBytes.byteLength);
+    expect(view.getUint32(0, true)).toBe(0x04034b50);
   });
 });

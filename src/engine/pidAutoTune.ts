@@ -12,6 +12,8 @@ import { Esp32BoardEnv, ESP32_BOARD_SPECS } from './esp32Codegen';
 export interface PidAutoTuneConstraints {
   targetRiseTimeSec: number;
   maxOvershootPct: number;
+  maxSettlingTimeSec?: number;
+  objective?: 'balanced' | 'min_settling_time';
   esp32Board?: Esp32BoardEnv;
 }
 
@@ -20,11 +22,15 @@ export interface PidAutoTuneResult {
   achievedRiseTimeSec: number | null;
   achievedOvershootPct: number | null;
   achievedSettlingTimeSec: number | null;
+  baselineSettlingTimeSec: number | null;
   closedLoopVerdict: StabilityVerdict;
   phaseMarginDeg: number | null;
   gainMarginDb: number | null;
   dampingRatio: number | null;
   meetsConstraints: boolean;
+  objective: 'balanced' | 'min_settling_time';
+  targetModelId: string;
+  targetModelName: string;
   esp32BoardLabel: string;
   loopRateHz: number;
   strategySummary: string;
@@ -154,22 +160,32 @@ export function autoTunePidGains(
 ): PidAutoTuneResult {
   const safeDt = Math.max(1e-5, model.baseDt);
   const loopRateHz = Math.round(1 / safeDt);
+  const objective: 'balanced' | 'min_settling_time' =
+    constraints.objective === 'min_settling_time' ? 'min_settling_time' : 'balanced';
+
   const minRise = Math.max(safeDt * 2.2, 1e-4);
   const maxRise = Math.max(minRise * 2, Math.max(model.duration, 10));
+  const defaults = getRecommendedAutoTuneDefaults(model);
   const targetRise = clamp(
     Number.isFinite(constraints.targetRiseTimeSec)
       ? constraints.targetRiseTimeSec
-      : getRecommendedAutoTuneDefaults(model).targetRiseTimeSec,
+      : defaults.targetRiseTimeSec,
     minRise,
     maxRise
   );
   const maxOvershoot = clamp(
     Number.isFinite(constraints.maxOvershootPct)
       ? constraints.maxOvershootPct
-      : 8,
+      : defaults.maxOvershootPct,
     0,
     50
   );
+  const maxSettlingTimeSec =
+    constraints.maxSettlingTimeSec !== undefined &&
+    Number.isFinite(constraints.maxSettlingTimeSec) &&
+    constraints.maxSettlingTimeSec > 0
+      ? constraints.maxSettlingTimeSec
+      : undefined;
 
   const outIdx = clamp(
     model.pid.targetOutputIndex,
@@ -185,7 +201,15 @@ export function autoTunePidGains(
       : clamp(-Math.log(mp) / Math.sqrt(Math.PI * Math.PI + Math.log(mp) ** 2), 0.25, 0.98);
 
   // Accurate approximation tr * wn ~ 1 + 1.1*zeta + 1.4*zeta^2
-  const wnTarget = (1.0 + 1.1 * zetaTarget + 1.4 * zetaTarget * zetaTarget) / targetRise;
+  const wnBase = (1.0 + 1.1 * zetaTarget + 1.4 * zetaTarget * zetaTarget) / targetRise;
+  const wnFromSettling = maxSettlingTimeSec
+    ? 4.2 / Math.max(0.05, zetaTarget * maxSettlingTimeSec)
+    : wnBase;
+  const wnTarget =
+    objective === 'min_settling_time'
+      ? Math.max(wnBase * 1.15, wnFromSettling)
+      : wnBase;
+
   const wcRatio = Math.sqrt(
     Math.sqrt(1 + 4 * zetaTarget ** 4) - 2 * zetaTarget * zetaTarget
   );
@@ -245,7 +269,7 @@ export function autoTunePidGains(
     kd: gainSign * (rawKp * tdFactor),
   };
 
-  // Second anchor: existing/baseline PID scaled smoothly if tracksStepRef
+  // Second anchor: existing/baseline PID
   const hasUsableBaseline =
     Math.abs(model.pid.kp) > 1e-9 &&
     (Math.abs(model.pid.ki) > 1e-9 || Math.abs(model.pid.kd) > 1e-9);
@@ -258,10 +282,15 @@ export function autoTunePidGains(
     : seedAnalytical;
 
   const evalHorizon = clamp(
-    Math.max(targetRise * 7.5, model.duration * 0.9),
+    Math.max(targetRise * 7.5, maxSettlingTimeSec ? maxSettlingTimeSec * 2.5 : 0, model.duration * 0.9),
     Math.max(safeDt * 40, targetRise * 4),
     Math.max(25, model.duration * 1.5)
   );
+
+  const baselineStep = model.pid.tracksStepRef
+    ? computeTransferFunctionStepResponse(model, 'closed', outIdx, 0, evalHorizon, 90)
+    : null;
+  const baselineSettlingTimeSec = baselineStep?.settlingTimeSec ?? null;
 
   let iterationsEvaluated = 0;
 
@@ -358,9 +387,11 @@ export function autoTunePidGains(
       const zeta = pz.minDampingRatio ?? pz.dampingRatio ?? 0.5;
       const zetaShortfall = Math.max(0, zetaTarget - zeta);
       const settle = imp.settlingTimeSec ?? evalHorizon;
-      const settleTarget = targetRise * 3.2;
+      const settleTarget = maxSettlingTimeSec ?? targetRise * 3.2;
       const cost =
-        3.0 * Math.abs(settle - settleTarget) / Math.max(0.05, settleTarget) +
+        (objective === 'min_settling_time'
+          ? 5.0 * (settle / Math.max(0.05, settleTarget))
+          : 3.0 * Math.abs(settle - settleTarget) / Math.max(0.05, settleTarget)) +
         12.0 * zetaShortfall +
         0.15 * imp.l2Energy;
 
@@ -387,7 +418,7 @@ export function autoTunePidGains(
       outIdx,
       0,
       evalHorizon,
-      highRes ? 120 : 64
+      highRes ? 120 : 68
     );
 
     if (stepRes.divergent || stepRes.riseTimeSec === null) {
@@ -410,34 +441,60 @@ export function autoTunePidGains(
 
     const rt = stepRes.riseTimeSec;
     const os = stepRes.overshootPct ?? 0;
+    const ts = stepRes.settlingTimeSec ?? evalHorizon;
     const ssErr = Math.abs(1 - stepRes.finalValue);
     const riseRelErr = Math.abs(rt - targetRise) / Math.max(1e-4, targetRise);
     const overshootViolation = Math.max(0, os - maxOvershoot);
     const overshootZeroGuard = maxOvershoot <= 0.5 ? os * 1.2 : 0;
 
-    // Slight preference to stay reasonably close to target settling without extreme derivative kick
-    const settleRatio =
-      (stepRes.settlingTimeSec ?? evalHorizon) / Math.max(0.02, targetRise * 5);
     const derivKickPenalty =
       Math.abs(kd) > Math.abs(kp) * Math.max(0.01, targetRise * 1.5)
-        ? 0.25 * (Math.abs(kd) / Math.max(1e-6, Math.abs(kp) * targetRise) - 1.5)
+        ? 0.22 * (Math.abs(kd) / Math.max(1e-6, Math.abs(kp) * targetRise) - 1.5)
         : 0;
 
-    const cost =
-      4.5 * riseRelErr +
-      1.8 * riseRelErr * riseRelErr +
-      0.6 * overshootViolation +
-      0.08 * overshootViolation * overshootViolation +
-      overshootZeroGuard +
-      6.0 * ssErr +
-      0.35 * settleRatio +
-      derivKickPenalty;
+    let cost: number;
+    let meets: boolean;
 
-    const meets =
-      rt <= targetRise * 1.18 &&
-      rt >= targetRise * 0.45 &&
-      os <= maxOvershoot + 0.35 &&
-      ssErr <= 0.05;
+    if (objective === 'min_settling_time') {
+      // Minimize 2% settling time ts while honoring overshoot & steady-state constraints
+      const tsNorm = ts / Math.max(0.05, maxSettlingTimeSec ?? targetRise * 3);
+      const tsCeilingPenalty = maxSettlingTimeSec
+        ? Math.max(0, ts - maxSettlingTimeSec) * 6.0
+        : 0;
+      const slowSettlePenalty = stepRes.settlingTimeSec === null ? 25.0 : 0;
+      cost =
+        5.5 * tsNorm +
+        tsCeilingPenalty +
+        slowSettlePenalty +
+        0.95 * overshootViolation +
+        0.15 * overshootViolation * overshootViolation +
+        overshootZeroGuard +
+        8.0 * ssErr +
+        0.15 * derivKickPenalty;
+
+      meets =
+        stepRes.settlingTimeSec !== null &&
+        os <= maxOvershoot + 0.5 &&
+        ssErr <= 0.05 &&
+        (maxSettlingTimeSec === undefined || ts <= maxSettlingTimeSec + 1e-3);
+    } else {
+      const settleRatio = ts / Math.max(0.02, targetRise * 5);
+      cost =
+        4.5 * riseRelErr +
+        1.8 * riseRelErr * riseRelErr +
+        0.6 * overshootViolation +
+        0.08 * overshootViolation * overshootViolation +
+        overshootZeroGuard +
+        6.0 * ssErr +
+        0.35 * settleRatio +
+        derivKickPenalty;
+
+      meets =
+        rt <= targetRise * 1.18 &&
+        rt >= targetRise * 0.45 &&
+        os <= maxOvershoot + 0.35 &&
+        ssErr <= 0.05;
+    }
 
     let phaseMarginDeg: number | null = null;
     let gainMarginDb: number | null = null;
@@ -468,11 +525,17 @@ export function autoTunePidGains(
 
   // Phase A: Multi-seed coarse grid around analytical loop-shaping seed and baseline seed
   const candidates: CandidateEval[] = [];
-  const kpScales = [0.25, 0.55, 1.0, 1.85, 3.4];
+  const kpScales =
+    objective === 'min_settling_time'
+      ? [0.35, 0.7, 1.0, 1.55, 2.4, 3.6]
+      : [0.25, 0.55, 1.0, 1.85, 3.4];
   const kiScales = model.pid.tracksStepRef
-    ? [0.25, 0.65, 1.25, 2.5]
+    ? objective === 'min_settling_time'
+      ? [0.35, 0.75, 1.35, 2.4]
+      : [0.25, 0.65, 1.25, 2.5]
     : [0, 0.25, 0.65, 1.25];
-  const kdScales = [0.35, 1.0, 2.2];
+  const kdScales =
+    objective === 'min_settling_time' ? [0.45, 1.0, 1.75, 2.8] : [0.35, 1.0, 2.2];
 
   const seeds = [seedAnalytical];
   if (
@@ -555,7 +618,10 @@ export function autoTunePidGains(
     ? 'ESP32-WROOM-32 (esp32dev)'
     : `${model.name} Target`;
 
-  const strategySummary = `Synthesized at ${loopRateHz} Hz (dt=${safeDt}s) targeting tr=${targetRise}s, OS≤${maxOvershoot}% with Nyquist-bounded N=${chosen.nFilter} rad/s`;
+  const strategySummary =
+    objective === 'min_settling_time'
+      ? `Unit-step settling-time minimization at ${loopRateHz} Hz (OS≤${maxOvershoot}%, N=${chosen.nFilter} rad/s)`
+      : `Synthesized at ${loopRateHz} Hz (dt=${safeDt}s) targeting tr=${targetRise}s, OS≤${maxOvershoot}% with Nyquist-bounded N=${chosen.nFilter} rad/s`;
 
   return {
     recommendedPid: {
@@ -567,11 +633,15 @@ export function autoTunePidGains(
     achievedRiseTimeSec: chosen.riseTimeSec,
     achievedOvershootPct: chosen.overshootPct,
     achievedSettlingTimeSec: chosen.settlingTimeSec,
+    baselineSettlingTimeSec,
     closedLoopVerdict: chosen.verdict,
     phaseMarginDeg: chosen.phaseMarginDeg,
     gainMarginDb: chosen.gainMarginDb,
     dampingRatio: chosen.dampingRatio,
     meetsConstraints: chosen.meetsConstraints,
+    objective,
+    targetModelId: model.id,
+    targetModelName: model.name,
     esp32BoardLabel,
     loopRateHz,
     strategySummary,

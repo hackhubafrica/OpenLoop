@@ -5,6 +5,10 @@ import {
   Esp32PinProfile,
   generateEsp32PlatformIoBundle,
 } from '../engine/esp32Codegen';
+import {
+  generateEsp32HilDeserializationCpp,
+  isHilCobsEnabled,
+} from '../engine/hil';
 import { serializeModelToToml } from '../engine/ir';
 
 // CRC-32 lookup table for valid standard ZIP archives
@@ -177,6 +181,11 @@ cd esp32_platformio && pio run -t upload
 rustc --crate-type lib --edition 2021 lib.rs -O
 `;
 
+  const esp32HilRxHeader = generateEsp32HilDeserializationCpp(
+    model,
+    isHilCobsEnabled(model)
+  );
+
   const blob = buildZipBlob([
     { name: 'model.ctrl.toml', content: toml },
     { name: 'c99/ctrl_model.h', content: code.cHeader },
@@ -186,6 +195,7 @@ rustc --crate-type lib --edition 2021 lib.rs -O
     { name: 'esp32_platformio/platformio.ini', content: pio.platformioIni },
     { name: 'esp32_platformio/include/ctrl_model.h', content: code.cHeader },
     { name: 'esp32_platformio/include/hil_frame.h', content: code.hilHeader },
+    { name: 'esp32_platformio/include/esp32_hil_rx.hpp', content: esp32HilRxHeader },
     { name: 'esp32_platformio/src/ctrl_model.c', content: code.cSource },
     { name: 'esp32_platformio/src/main.cpp', content: pio.mainCpp },
     { name: 'esp32_platformio/WIRING.md', content: pio.wiringMarkdown },
@@ -318,17 +328,44 @@ export function buildEsp32PlatformIoZipEntries(
 ): ZipEntry[] {
   const code = generateEmbeddedCode(model, discrete);
   const pio = generateEsp32PlatformIoBundle(model, discrete, profile);
+  const cobsActive = isHilCobsEnabled(model);
+  const esp32HilRxHeader = generateEsp32HilDeserializationCpp(model, cobsActive);
   const toml = serializeModelToToml(model);
   const root = `openloop-${model.id}-esp32-pio`;
+
+  const pioReadme = `# OpenLoop PlatformIO ESP32 Project — ${model.name}
+
+- Target Board Environment: \`${pio.boardSpec.label}\` (\`${pio.boardSpec.id}\`)
+- Control Loop Period: \`dt = ${model.baseDt} s\` (${Math.round(1 / model.baseDt)} Hz) · ${discrete.method.toUpperCase()}
+- HIL Serial Framing: \`${cobsActive ? 'COBS (0x00 delimiter) + CRC-16-CCITT' : 'Raw 28B Binary + CRC-16-CCITT'}\`
+
+## Included Files
+- \`platformio.ini\`            : Pre-configured PlatformIO build flags, baud rate & sensor dependencies
+- \`include/ctrl_model.h\`      : Zero-allocation C99 public controller API & state struct
+- \`include/hil_frame.h\`       : Binary HIL frame struct, CRC-16-CCITT & COBS codec
+- \`include/esp32_hil_rx.hpp\`  : C++ ESP32 closed-loop HIL serial deserializer header
+- \`src/ctrl_model.c\`          : Discretized C99 fixed-step control loop kernel
+- \`src/main.cpp\`              : Arduino framework firmware entrypoint & sensor/PWM loop
+- \`WIRING.md\`                 : GPIO hardware mapping & electrical protection guide
+
+## Build & Upload (PlatformIO CLI)
+\`\`\`sh
+pio run -e ${pio.boardSpec.id}
+pio run -e ${pio.boardSpec.id} -t upload
+pio device monitor -b ${profile.baudRate}
+\`\`\`
+`;
 
   return [
     { name: `${root}/platformio.ini`, content: pio.platformioIni },
     { name: `${root}/include/ctrl_model.h`, content: code.cHeader },
     { name: `${root}/include/hil_frame.h`, content: code.hilHeader },
+    { name: `${root}/include/esp32_hil_rx.hpp`, content: esp32HilRxHeader },
     { name: `${root}/src/ctrl_model.c`, content: code.cSource },
     { name: `${root}/src/main.cpp`, content: pio.mainCpp },
     { name: `${root}/model.ctrl.toml`, content: toml },
     { name: `${root}/WIRING.md`, content: pio.wiringMarkdown },
+    { name: `${root}/README.md`, content: pioReadme },
   ];
 }
 

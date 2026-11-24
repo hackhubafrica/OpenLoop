@@ -138,6 +138,7 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
   const [maxOvershootPct, setMaxOvershootPct] = useState<number>(
     initialTuneDefaults.maxOvershootPct
   );
+  const [maxSettlingTimeSec, setMaxSettlingTimeSec] = useState<number>(0.85);
   const [autoTuneResult, setAutoTuneResult] = useState<PidAutoTuneResult | null>(
     null
   );
@@ -147,6 +148,11 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
     const nextDefaults = getRecommendedAutoTuneDefaults(model);
     setTargetRiseTimeSec(nextDefaults.targetRiseTimeSec);
     setMaxOvershootPct(nextDefaults.maxOvershootPct);
+    setMaxSettlingTimeSec(
+      model.id === 'esp32_ultrasonic_hold'
+        ? 0.85
+        : Number(Math.max(model.baseDt * 8, nextDefaults.targetRiseTimeSec * 2.5).toPrecision(2))
+    );
     setAutoTuneResult(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model.id]);
@@ -237,6 +243,28 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
     const result = autoTunePidGains(model, {
       targetRiseTimeSec,
       maxOvershootPct,
+      maxSettlingTimeSec,
+      objective: 'balanced',
+      esp32Board: autoTuneBoard,
+    });
+    setAutoTuneResult(result);
+  };
+
+  const handleAutoTuneUltrasonicSettlingTime = () => {
+    const ultrasonicTemplate = getPlantTemplateById('esp32_ultrasonic_hold')?.model;
+    const targetModel =
+      model.id === 'esp32_ultrasonic_hold'
+        ? model
+        : ultrasonicTemplate ?? model;
+
+    const result = autoTunePidGains(targetModel, {
+      targetRiseTimeSec:
+        targetModel.id === 'esp32_ultrasonic_hold'
+          ? Math.min(targetRiseTimeSec, 0.35)
+          : targetRiseTimeSec,
+      maxOvershootPct,
+      maxSettlingTimeSec,
+      objective: 'min_settling_time',
       esp32Board: autoTuneBoard,
     });
     setAutoTuneResult(result);
@@ -244,6 +272,21 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
 
   const handleApplySuggestedPid = () => {
     if (!autoTuneResult) return;
+    if (autoTuneResult.targetModelId !== model.id) {
+      const targetTemplate = getPlantTemplateById(autoTuneResult.targetModelId)?.model;
+      if (targetTemplate) {
+        onChangeModel({
+          ...targetTemplate,
+          pid: {
+            ...targetTemplate.pid,
+            enabled: true,
+            ...autoTuneResult.recommendedPid,
+          },
+        });
+        revealPoleZeroClosedLoop();
+        return;
+      }
+    }
     handlePidUpdate({
       enabled: true,
       ...autoTuneResult.recommendedPid,
@@ -1002,23 +1045,59 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
                 </div>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="p-2 rounded border border-slate-800/80 bg-[#0B0E17] flex items-center justify-between gap-2">
+                <label
+                  htmlFor="schema-autotune-ts"
+                  className="text-[10px] font-mono text-slate-400"
+                >
+                  Settling Target t_s (s) · ESP32+Ultrasonic Step
+                </label>
+                <input
+                  id="schema-autotune-ts"
+                  type="number"
+                  min={Number((model.baseDt * 4).toPrecision(2))}
+                  max={Math.max(12, model.duration)}
+                  step={0.05}
+                  value={maxSettlingTimeSec}
+                  onChange={(e) => {
+                    const val = Number(e.target.value);
+                    if (Number.isFinite(val) && val > 0) {
+                      setMaxSettlingTimeSec(val);
+                    }
+                  }}
+                  className="w-18 bg-[#07090E] border border-slate-800 rounded px-1.5 py-0.5 text-[10.5px] font-mono tabular-nums text-right text-emerald-300 focus:outline-none focus:border-cyan-400"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleAutoTuneUltrasonicSettlingTime}
+                  title="Simulate closed-loop unit step response on ESP32 + Ultrasonic model and minimize 2% settling time t_s"
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 py-1.5 px-2.5 text-[11px] font-mono font-semibold rounded border border-emerald-500/50 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-emerald-300" />
+                  Auto-Tune
+                </button>
                 <button
                   type="button"
                   onClick={handleRunPidAutoTune}
+                  title="Suggest PID gains for currently active model using rise-time and overshoot targets"
                   className="flex-1 inline-flex items-center justify-center gap-1.5 py-1.5 px-2.5 text-[11px] font-mono font-medium rounded border border-cyan-500/50 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                 >
-                  <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+                  <SlidersHorizontal className="w-3.5 h-3.5 text-cyan-300" />
                   Suggest Optimal PID
                 </button>
                 {autoTuneResult && (
                   <button
                     type="button"
                     onClick={handleApplySuggestedPid}
-                    className="inline-flex items-center justify-center gap-1 py-1.5 px-2.5 text-[11px] font-mono font-medium rounded border border-emerald-500/50 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                    className="w-full inline-flex items-center justify-center gap-1 py-1.5 px-2.5 text-[11px] font-mono font-medium rounded border border-cyan-500/50 bg-[#0B0E17] hover:bg-slate-800 text-cyan-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                   >
                     <Check className="w-3.5 h-3.5 text-emerald-400" />
-                    Apply Gains
+                    {autoTuneResult.targetModelId !== model.id
+                      ? 'Load ESP32+Ultrasonic & Apply Gains'
+                      : 'Apply Gains'}
                   </button>
                 )}
               </div>
@@ -1038,9 +1117,18 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
                         : '▲ Closest Stable Trade-off'}
                     </span>
                     <span className="text-slate-400">
+                      {autoTuneResult.objective === 'min_settling_time'
+                        ? 'Min t_s · '
+                        : ''}
                       {autoTuneResult.iterationsEvaluated} evals
                     </span>
                   </div>
+
+                  {autoTuneResult.targetModelId !== model.id && (
+                    <div className="text-[9.5px] text-cyan-300 truncate">
+                      Target: {autoTuneResult.targetModelName}
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-4 gap-1.5 text-center">
                     <div className="p-1 rounded bg-[#07090E] border border-slate-800/80">
@@ -1069,28 +1157,32 @@ export const SchemaView: React.FC<SchemaViewProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400 pt-0.5">
+                  <div className="grid grid-cols-2 gap-1.5 text-[10px] text-slate-400 pt-0.5">
                     <span>
-                      Pred t_r:{' '}
+                      Settling t_s:{' '}
+                      <span className="text-emerald-300 font-semibold">
+                        {autoTuneResult.achievedSettlingTimeSec !== null
+                          ? `${autoTuneResult.achievedSettlingTimeSec.toFixed(3)}s`
+                          : '—'}
+                      </span>
+                      {autoTuneResult.baselineSettlingTimeSec !== null && (
+                        <span className="text-slate-500">
+                          {' '}
+                          (was {autoTuneResult.baselineSettlingTimeSec.toFixed(2)}s)
+                        </span>
+                      )}
+                    </span>
+                    <span className="text-right">
+                      t_r:{' '}
                       <span className="text-slate-200">
                         {autoTuneResult.achievedRiseTimeSec !== null
                           ? `${autoTuneResult.achievedRiseTimeSec.toFixed(3)}s`
                           : '—'}
-                      </span>
-                    </span>
-                    <span>
-                      OS:{' '}
+                      </span>{' '}
+                      · OS:{' '}
                       <span className="text-slate-200">
                         {autoTuneResult.achievedOvershootPct !== null
                           ? `${autoTuneResult.achievedOvershootPct.toFixed(1)}%`
-                          : '—'}
-                      </span>
-                    </span>
-                    <span>
-                      PM:{' '}
-                      <span className="text-slate-200">
-                        {autoTuneResult.phaseMarginDeg !== null
-                          ? `${autoTuneResult.phaseMarginDeg.toFixed(1)}°`
                           : '—'}
                       </span>
                     </span>

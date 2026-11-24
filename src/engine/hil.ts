@@ -161,6 +161,308 @@ export function createHilPacket(
   };
 }
 
+export interface HilWireFrameFields {
+  seq: number;
+  tickUs: number;
+  ref: number;
+  y0: number;
+  y1: number;
+  uCmd: number;
+}
+
+export function encodeHilWireFrameBytes(
+  model: ControlModel,
+  fields: HilWireFrameFields
+): Uint8Array {
+  const buf = new ArrayBuffer(28);
+  const view = new DataView(buf);
+  view.setUint16(0, 0xaa55, false);
+  view.setUint32(2, fields.seq >>> 0, true);
+  view.setUint32(6, fields.tickUs >>> 0, true);
+  view.setFloat32(10, fields.ref, true);
+  view.setFloat32(14, fields.y0, true);
+  view.setFloat32(18, fields.y1, true);
+  view.setFloat32(22, fields.uCmd, true);
+
+  const crc = crc16Ccitt(new Uint8Array(buf, 0, 26));
+  view.setUint16(26, crc, true);
+
+  const rawBytes = new Uint8Array(buf);
+  return isHilCobsEnabled(model) ? cobsEncode(rawBytes) : rawBytes;
+}
+
+export function computeHilFrameCrc16(fields: HilWireFrameFields): number {
+  const buf = new ArrayBuffer(26);
+  const view = new DataView(buf);
+  view.setUint16(0, 0xaa55, false);
+  view.setUint32(2, fields.seq >>> 0, true);
+  view.setUint32(6, fields.tickUs >>> 0, true);
+  view.setFloat32(10, fields.ref, true);
+  view.setFloat32(14, fields.y0, true);
+  view.setFloat32(18, fields.y1, true);
+  view.setFloat32(22, fields.uCmd, true);
+  return crc16Ccitt(new Uint8Array(buf, 0, 26));
+}
+
+export interface HilLoopbackDiagnostic {
+  id: number;
+  timestamp: string;
+  mode: 'webserial' | 'bridge' | 'simulated';
+  targetLabel: string;
+  protocol: 'COBS + CRC16' | 'RAW + CRC16';
+  txSeq: number;
+  rxSeq: number | null;
+  txBytes: number;
+  rxBytes: number;
+  expectedCrc16: number;
+  rxCrc16: number | null;
+  crcValid: boolean;
+  payloadMatch: boolean;
+  rttMs: number;
+  budgetMs: number;
+  verdict: 'PASS' | 'WARN_LATENCY' | 'FAIL';
+  summary: string;
+}
+
+export interface EvaluateHilLoopbackInput {
+  id: number;
+  mode: HilLoopbackDiagnostic['mode'];
+  targetLabel: string;
+  cobsEnabled: boolean;
+  txSeq: number;
+  txBytes: number;
+  expectedCrc16: number;
+  budgetMs: number;
+  rttMs: number;
+  rxPacket?: HilFramePacket | null;
+  rxSeq?: number | null;
+  rxBytes?: number;
+  rxCrc16?: number | null;
+  crcValid?: boolean;
+  errorMessage?: string | null;
+}
+
+export function evaluateHilLoopbackDiagnostic(
+  input: EvaluateHilLoopbackInput
+): HilLoopbackDiagnostic {
+  const protocol: HilLoopbackDiagnostic['protocol'] = input.cobsEnabled
+    ? 'COBS + CRC16'
+    : 'RAW + CRC16';
+  const rttMs = Number(Math.max(0, input.rttMs).toFixed(3));
+  const budgetMs = Number(Math.max(0.01, input.budgetMs).toFixed(3));
+  const rxSeq = input.rxPacket?.seq ?? input.rxSeq ?? null;
+  const rxCrc16 = input.rxPacket?.crc16 ?? input.rxCrc16 ?? null;
+  const rxBytes = input.rxPacket?.byteLength ?? input.rxBytes ?? 0;
+  const crcValid =
+    input.errorMessage != null
+      ? false
+      : input.crcValid ?? (input.rxPacket != null && input.rxPacket.crc16 >= 0);
+
+  const payloadMatch =
+    crcValid &&
+    rxSeq === input.txSeq &&
+    (rxCrc16 === null || rxCrc16 === input.expectedCrc16);
+
+  let verdict: HilLoopbackDiagnostic['verdict'] = 'FAIL';
+  let summary = '';
+
+  if (input.errorMessage) {
+    verdict = 'FAIL';
+    summary = input.errorMessage;
+  } else if (!crcValid || rxSeq === null) {
+    verdict = 'FAIL';
+    summary =
+      rxBytes === 0
+        ? `No loopback reply received on ${input.targetLabel} within timeout.`
+        : `CRC-16 mismatch on ${input.targetLabel} (expected 0x${input.expectedCrc16
+            .toString(16)
+            .toUpperCase()
+            .padStart(4, '0')}).`;
+  } else if (rttMs > budgetMs) {
+    verdict = 'WARN_LATENCY';
+    summary = `CRC-16 valid (${
+      payloadMatch ? 'exact echo' : `telemetry reply #${rxSeq}`
+    }), but RTT ${rttMs.toFixed(3)} ms exceeds ${budgetMs.toFixed(2)} ms tick budget.`;
+  } else {
+    verdict = 'PASS';
+    summary = `HIL integrity confirmed (${
+      payloadMatch ? 'exact packet echo' : `CRC-verified reply #${rxSeq}`
+    }) in ${rttMs.toFixed(3)} ms ≤ ${budgetMs.toFixed(2)} ms budget.`;
+  }
+
+  return {
+    id: input.id,
+    timestamp: new Date().toLocaleTimeString([], { hour12: false }),
+    mode: input.mode,
+    targetLabel: input.targetLabel,
+    protocol,
+    txSeq: input.txSeq,
+    rxSeq,
+    txBytes: input.txBytes,
+    rxBytes,
+    expectedCrc16: input.expectedCrc16,
+    rxCrc16,
+    crcValid,
+    payloadMatch,
+    rttMs,
+    budgetMs,
+    verdict,
+    summary,
+  };
+}
+
+export type HilStreamParseEvent =
+  | { ok: true; packet: HilFramePacket }
+  | { ok: false; reason: 'cobs' | 'crc' | 'length' };
+
+export function parseRawHilFrameBytes(
+  rawBytes: Uint8Array,
+  model: ControlModel,
+  wireBytes: Uint8Array,
+  prevTimestampMs?: number,
+  nowMs: number = Date.now()
+): HilStreamParseEvent {
+  if (rawBytes.length !== 28) {
+    return { ok: false, reason: 'length' };
+  }
+  const view = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
+  const sof = view.getUint16(0, false);
+  if (sof !== 0xaa55) {
+    return { ok: false, reason: 'length' };
+  }
+  const frameCrc = view.getUint16(26, true);
+  const computedCrc = crc16Ccitt(rawBytes.subarray(0, 26));
+  if (frameCrc !== computedCrc) {
+    return { ok: false, reason: 'crc' };
+  }
+
+  const seq = view.getUint32(2, true);
+  const tickUs = view.getUint32(6, true);
+  const payloadFloats = [
+    view.getFloat32(10, true),
+    view.getFloat32(14, true),
+    view.getFloat32(18, true),
+    view.getFloat32(22, true),
+  ];
+
+  const budgetMs = model.baseDt * 1000;
+  const rttMs =
+    prevTimestampMs !== undefined
+      ? Number(Math.max(0.05, nowMs - prevTimestampMs).toFixed(3))
+      : Number((budgetMs * 0.45).toFixed(3));
+  const deadlineMissed = rttMs > budgetMs * 1.5;
+
+  return {
+    ok: true,
+    packet: {
+      seq,
+      tickUs,
+      simTime: Number((tickUs * 1e-6).toFixed(4)),
+      transport: model.hil.transport,
+      payloadFloats,
+      crc16: frameCrc,
+      rawHex: toHex(rawBytes),
+      wireHex: toHex(wireBytes),
+      byteLength: wireBytes.length,
+      rttMs,
+      dropped: false,
+      deadlineMissed,
+      watchdogState: deadlineMissed ? 'WARN' : 'NOMINAL',
+    },
+  };
+}
+
+/**
+ * Stateful streaming accumulator that parses arbitrary-length USB CDC / UART
+ * chunks into CRC-verified COBS or Raw 28-byte HIL packets.
+ */
+export class HilSerialStreamAccumulator {
+  private buffer: number[] = [];
+  private lastPacketTimeMs: number | undefined;
+  private static readonly MAX_COBS_BUFFER = 48;
+
+  public reset(): void {
+    this.buffer = [];
+    this.lastPacketTimeMs = undefined;
+  }
+
+  public pushChunk(
+    chunk: Uint8Array,
+    model: ControlModel,
+    cobsEnabled: boolean,
+    nowMs: number = Date.now()
+  ): HilStreamParseEvent[] {
+    const events: HilStreamParseEvent[] = [];
+
+    if (cobsEnabled) {
+      for (let i = 0; i < chunk.length; i++) {
+        const b = chunk[i];
+        if (b === 0x00) {
+          if (this.buffer.length > 0) {
+            const wireBytes = Uint8Array.from([...this.buffer, 0x00]);
+            this.buffer = [];
+            const decoded = cobsDecode(wireBytes);
+            if (!decoded) {
+              events.push({ ok: false, reason: 'cobs' });
+            } else {
+              const parsed = parseRawHilFrameBytes(
+                decoded,
+                model,
+                wireBytes,
+                this.lastPacketTimeMs,
+                nowMs
+              );
+              if (parsed.ok) {
+                this.lastPacketTimeMs = nowMs;
+              }
+              events.push(parsed);
+            }
+          }
+        } else if (this.buffer.length < HilSerialStreamAccumulator.MAX_COBS_BUFFER) {
+          this.buffer.push(b);
+        } else {
+          // Overrun guard: discard noise until next 0x00 delimiter
+          this.buffer = [];
+        }
+      }
+      return events;
+    }
+
+    // Raw unstuffed binary mode: sync on 0xAA 0x55 and collect 28 bytes
+    for (let i = 0; i < chunk.length; i++) {
+      const b = chunk[i];
+      if (this.buffer.length === 0) {
+        if (b === 0xaa) this.buffer.push(b);
+      } else if (this.buffer.length === 1) {
+        if (b === 0x55) {
+          this.buffer.push(b);
+        } else {
+          this.buffer = b === 0xaa ? [0xaa] : [];
+        }
+      } else {
+        this.buffer.push(b);
+        if (this.buffer.length === 28) {
+          const rawBytes = Uint8Array.from(this.buffer);
+          this.buffer = [];
+          const parsed = parseRawHilFrameBytes(
+            rawBytes,
+            model,
+            rawBytes,
+            this.lastPacketTimeMs,
+            nowMs
+          );
+          if (parsed.ok) {
+            this.lastPacketTimeMs = nowMs;
+          }
+          events.push(parsed);
+        }
+      }
+    }
+
+    return events;
+  }
+}
+
 export function buildHilFrameStream(
   model: ControlModel,
   trace: SimulationTrace,
@@ -282,6 +584,333 @@ export function extractTelemetryStripSeries(
       watchdogState: pkt.watchdogState,
     };
   });
+}
+
+export type TelemetryChannelId = TelemetryChannelMeta['id'];
+
+export interface TelemetryLocalPeak {
+  seq: number;
+  simTime: number;
+  value: number;
+}
+
+export interface TelemetryPeakAndCursorAnalysis {
+  channelId: TelemetryChannelId;
+  sampleCount: number;
+  windowMin: TelemetryStripSample | null;
+  windowMax: TelemetryStripSample | null;
+  windowPeakToPeak: number;
+  windowMean: number;
+  windowRms: number;
+  localPeaks: TelemetryLocalPeak[];
+  cursorA: TelemetryStripSample | null;
+  cursorB: TelemetryStripSample | null;
+  deltaSeq: number | null;
+  deltaTimeSec: number | null;
+  frequencyHz: number | null;
+  deltaValue: number | null;
+  deltaPct: number | null;
+  intervalMin: TelemetryStripSample | null;
+  intervalMax: TelemetryStripSample | null;
+  intervalPeakToPeak: number | null;
+  intervalMean: number | null;
+  intervalRms: number | null;
+}
+
+function resolveCursorSample(
+  samples: TelemetryStripSample[],
+  targetSeq: number | null | undefined
+): { sample: TelemetryStripSample; index: number } | null {
+  if (samples.length === 0 || targetSeq === null || targetSeq === undefined) {
+    return null;
+  }
+  let bestIdx = 0;
+  let bestDist = Math.abs(samples[0].seq - targetSeq);
+  for (let i = 1; i < samples.length; i++) {
+    const dist = Math.abs(samples[i].seq - targetSeq);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  return { sample: samples[bestIdx], index: bestIdx };
+}
+
+function computeSeriesStats(
+  samples: TelemetryStripSample[],
+  channelId: TelemetryChannelId
+): {
+  minSample: TelemetryStripSample | null;
+  maxSample: TelemetryStripSample | null;
+  peakToPeak: number;
+  mean: number;
+  rms: number;
+} {
+  if (samples.length === 0) {
+    return {
+      minSample: null,
+      maxSample: null,
+      peakToPeak: 0,
+      mean: 0,
+      rms: 0,
+    };
+  }
+  let minSample = samples[0];
+  let maxSample = samples[0];
+  let minVal = samples[0][channelId];
+  let maxVal = samples[0][channelId];
+  let sum = 0;
+  let sumSq = 0;
+
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    const v = s[channelId];
+    if (v < minVal) {
+      minVal = v;
+      minSample = s;
+    }
+    if (v > maxVal) {
+      maxVal = v;
+      maxSample = s;
+    }
+    sum += v;
+    sumSq += v * v;
+  }
+
+  return {
+    minSample,
+    maxSample,
+    peakToPeak: maxVal - minVal,
+    mean: sum / samples.length,
+    rms: Math.sqrt(sumSq / samples.length),
+  };
+}
+
+export function analyzeTelemetryChannelWindow(
+  samples: TelemetryStripSample[],
+  channelId: TelemetryChannelId,
+  cursorASeq?: number | null,
+  cursorBSeq?: number | null
+): TelemetryPeakAndCursorAnalysis {
+  if (samples.length === 0) {
+    return {
+      channelId,
+      sampleCount: 0,
+      windowMin: null,
+      windowMax: null,
+      windowPeakToPeak: 0,
+      windowMean: 0,
+      windowRms: 0,
+      localPeaks: [],
+      cursorA: null,
+      cursorB: null,
+      deltaSeq: null,
+      deltaTimeSec: null,
+      frequencyHz: null,
+      deltaValue: null,
+      deltaPct: null,
+      intervalMin: null,
+      intervalMax: null,
+      intervalPeakToPeak: null,
+      intervalMean: null,
+      intervalRms: null,
+    };
+  }
+
+  const winStats = computeSeriesStats(samples, channelId);
+
+  // Detect local maxima (handles single-point peaks and flat plateaus cleanly)
+  const localPeaks: TelemetryLocalPeak[] = [];
+  for (let i = 1; i < samples.length - 1; i++) {
+    const prev = samples[i - 1][channelId];
+    const curr = samples[i][channelId];
+    const next = samples[i + 1][channelId];
+    if (curr > prev && curr >= next) {
+      // Advance past flat plateau if equal values continue
+      let j = i;
+      while (j + 1 < samples.length - 1 && samples[j + 1][channelId] === curr) {
+        j++;
+      }
+      if (samples[j + 1][channelId] < curr) {
+        localPeaks.push({
+          seq: samples[i].seq,
+          simTime: samples[i].simTime,
+          value: curr,
+        });
+      }
+      i = j;
+    }
+  }
+  localPeaks.sort((a, b) => b.value - a.value);
+
+  const resolvedA = resolveCursorSample(samples, cursorASeq);
+  const resolvedB = resolveCursorSample(samples, cursorBSeq);
+  const cursorA = resolvedA?.sample ?? null;
+  const cursorB = resolvedB?.sample ?? null;
+
+  if (!resolvedA || !resolvedB) {
+    return {
+      channelId,
+      sampleCount: samples.length,
+      windowMin: winStats.minSample,
+      windowMax: winStats.maxSample,
+      windowPeakToPeak: winStats.peakToPeak,
+      windowMean: winStats.mean,
+      windowRms: winStats.rms,
+      localPeaks,
+      cursorA,
+      cursorB,
+      deltaSeq: null,
+      deltaTimeSec: null,
+      frequencyHz: null,
+      deltaValue: null,
+      deltaPct: null,
+      intervalMin: null,
+      intervalMax: null,
+      intervalPeakToPeak: null,
+      intervalMean: null,
+      intervalRms: null,
+    };
+  }
+
+  const loIdx = Math.min(resolvedA.index, resolvedB.index);
+  const hiIdx = Math.max(resolvedA.index, resolvedB.index);
+  const intervalSlice = samples.slice(loIdx, hiIdx + 1);
+  const intervalStats = computeSeriesStats(intervalSlice, channelId);
+
+  const valA = resolvedA.sample[channelId];
+  const valB = resolvedB.sample[channelId];
+  const deltaSeq = resolvedB.sample.seq - resolvedA.sample.seq;
+  const deltaTimeSec = resolvedB.sample.simTime - resolvedA.sample.simTime;
+  const absDt = Math.abs(deltaTimeSec);
+  const frequencyHz = absDt > 1e-6 ? 1 / absDt : null;
+  const deltaValue = valB - valA;
+  const deltaPct =
+    Math.abs(valA) > 1e-9 ? ((valB - valA) / Math.abs(valA)) * 100 : null;
+
+  return {
+    channelId,
+    sampleCount: samples.length,
+    windowMin: winStats.minSample,
+    windowMax: winStats.maxSample,
+    windowPeakToPeak: winStats.peakToPeak,
+    windowMean: winStats.mean,
+    windowRms: winStats.rms,
+    localPeaks,
+    cursorA,
+    cursorB,
+    deltaSeq,
+    deltaTimeSec,
+    frequencyHz,
+    deltaValue,
+    deltaPct,
+    intervalMin: intervalStats.minSample,
+    intervalMax: intervalStats.maxSample,
+    intervalPeakToPeak: intervalStats.peakToPeak,
+    intervalMean: intervalStats.mean,
+    intervalRms: intervalStats.rms,
+  };
+}
+
+export interface TelemetryChannelYScale {
+  min: number;
+  max: number;
+  rawMin: number;
+  rawMax: number;
+  peakToPeak: number;
+  perDiv: number;
+}
+
+export function computeNominalTelemetryRange(
+  model: ControlModel,
+  channelId: TelemetryChannelId
+): { min: number; max: number } {
+  if (channelId === 'uCmd') {
+    const lo = Math.min(model.limits.satMin, model.hil.safeClampValue);
+    const hi = Math.max(model.limits.satMax, model.hil.safeClampValue);
+    const span = Math.max(1e-3, hi - lo);
+    return { min: lo - span * 0.08, max: hi + span * 0.08 };
+  }
+  const refTarget = Math.max(
+    Math.abs(model.reference.initialValue),
+    Math.abs(model.reference.finalValue)
+  );
+  if (channelId === 'ref' || channelId === 'y0') {
+    if (refTarget > 1e-4) {
+      const lo = Math.min(0, model.reference.initialValue, model.reference.finalValue);
+      const hi = Math.max(0, model.reference.initialValue, model.reference.finalValue);
+      const span = Math.max(refTarget, hi - lo);
+      return { min: lo - span * 0.2, max: hi + span * 0.35 };
+    }
+    return { min: -1, max: 1 };
+  }
+  const span = refTarget > 1e-4 ? refTarget * 1.2 : 1;
+  return { min: -span, max: span };
+}
+
+function niceScaleStep(rawStep: number): number {
+  if (!Number.isFinite(rawStep) || rawStep <= 0) return 0.25;
+  const exp = Math.floor(Math.log10(rawStep));
+  const pow10 = Math.pow(10, exp);
+  const frac = rawStep / pow10;
+  const niceFrac =
+    frac <= 1 ? 1 : frac <= 2 ? 2 : frac <= 2.5 ? 2.5 : frac <= 5 ? 5 : 10;
+  return niceFrac * pow10;
+}
+
+export function computeTelemetryChannelYScale(
+  samples: TelemetryStripSample[],
+  channelId: TelemetryChannelId,
+  model: ControlModel,
+  yDivs: number = 4,
+  headroomFraction: number = 0.16
+): TelemetryChannelYScale {
+  const divs = Math.max(1, yDivs);
+  if (samples.length === 0) {
+    const nom = computeNominalTelemetryRange(model, channelId);
+    const step = niceScaleStep((nom.max - nom.min) / divs);
+    const min = Math.floor(nom.min / step) * step;
+    const max = Math.ceil(nom.max / step) * step;
+    const safeMax = max <= min ? min + step * divs : max;
+    return {
+      min,
+      max: safeMax,
+      rawMin: nom.min,
+      rawMax: nom.max,
+      peakToPeak: nom.max - nom.min,
+      perDiv: (safeMax - min) / divs,
+    };
+  }
+
+  let rawMin = samples[0][channelId];
+  let rawMax = samples[0][channelId];
+  for (let i = 1; i < samples.length; i++) {
+    const v = samples[i][channelId];
+    if (v < rawMin) rawMin = v;
+    if (v > rawMax) rawMax = v;
+  }
+
+  const peakToPeak = Math.max(0, rawMax - rawMin);
+  const pad =
+    peakToPeak > 1e-6
+      ? peakToPeak * headroomFraction
+      : Math.max(0.25, Math.abs(rawMax) * 0.25);
+
+  const paddedMin = rawMin - pad;
+  const paddedMax = rawMax + pad;
+  const step = niceScaleStep((paddedMax - paddedMin) / divs);
+  const min = Math.floor(paddedMin / step) * step;
+  const max = Math.ceil(paddedMax / step) * step;
+  const safeMax = max <= min ? min + step * divs : max;
+
+  return {
+    min,
+    max: safeMax,
+    rawMin,
+    rawMax,
+    peakToPeak,
+    perDiv: (safeMax - min) / divs,
+  };
 }
 
 export function generateEsp32HilDeserializationCpp(

@@ -10,6 +10,7 @@ import {
   RotateCcw,
   Terminal,
   XCircle,
+  Zap,
 } from 'lucide-react';
 import { ControlModel, DiscretizationMethod, DiscretizedMatrices } from '../types/control';
 import { generateEmbeddedCode } from '../engine/codegen';
@@ -23,7 +24,9 @@ import {
   getDefaultEsp32PinProfile,
   resolveEsp32Sensors,
 } from '../engine/esp32Codegen';
+import { generateEsp32HilDeserializationCpp, isHilCobsEnabled } from '../engine/hil';
 import { exportEsp32PlatformIoZip, exportTextFile } from '../utils/exportBundle';
+import { Esp32FlashPanel } from './Esp32FlashPanel';
 import { Esp32HardwareMap } from './Esp32HardwareMap';
 
 interface CompilerCheckOutcome {
@@ -52,7 +55,7 @@ interface CodegenViewProps {
 
 type CFileTab = 'ctrl_model.h' | 'ctrl_model.c' | 'hil_frame.h';
 type TargetStudioMode = 'core' | 'esp32_pio';
-type PioTab = 'hardware_map' | 'main.cpp' | 'platformio.ini';
+type PioTab = 'hardware_map' | 'build_flash' | 'main.cpp' | 'platformio.ini';
 
 export const CodegenView: React.FC<CodegenViewProps> = ({
   model,
@@ -123,6 +126,10 @@ export const CodegenView: React.FC<CodegenViewProps> = ({
         sensors: activeSensors,
       }),
     [model, discrete, pinProfile, activeSensors]
+  );
+  const esp32HilRxHeader = useMemo(
+    () => generateEsp32HilDeserializationCpp(model, isHilCobsEnabled(model)),
+    [model]
   );
 
   const activeCCode =
@@ -247,8 +254,21 @@ export const CodegenView: React.FC<CodegenViewProps> = ({
             </button>
             <button
               type="button"
+              onClick={() =>
+                exportEsp32PlatformIoZip(model, discrete, {
+                  ...pinProfile,
+                  sensors: activeSensors,
+                })
+              }
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 border border-cyan-500/50 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <Cpu className="w-3.5 h-3.5 text-cyan-300" />
+              Generate PlatformIO Project
+            </button>
+            <button
+              type="button"
               onClick={onDownloadPresetZip}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#07090E] hover:bg-slate-800 text-emerald-300 border border-slate-700 rounded transition-colors cursor-pointer whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#07090E] hover:bg-slate-800 text-emerald-300 border border-slate-700 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
               <Archive className="w-3.5 h-3.5" />
               Download Preset as ZIP
@@ -638,7 +658,19 @@ export const CodegenView: React.FC<CodegenViewProps> = ({
                 className="w-full inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold rounded border border-cyan-500/50 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Archive className="w-3.5 h-3.5" />
-                Download PlatformIO Project (.zip)
+                Generate PlatformIO Project (.zip)
+              </button>
+              <button
+                type="button"
+                onClick={() => setPioTab('build_flash')}
+                className={`w-full inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold rounded border transition-colors cursor-pointer whitespace-nowrap ${
+                  pioTab === 'build_flash'
+                    ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                    : 'border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300'
+                }`}
+              >
+                <Zap className="w-3.5 h-3.5" />
+                Build &amp; Flash ESP32
               </button>
             </div>
           </aside>
@@ -650,6 +682,7 @@ export const CodegenView: React.FC<CodegenViewProps> = ({
                 {(
                   [
                     { id: 'hardware_map', label: 'ESP32 Hardware Map' },
+                    { id: 'build_flash', label: 'Build & Flash' },
                     { id: 'main.cpp', label: 'src/main.cpp' },
                     { id: 'platformio.ini', label: 'platformio.ini' },
                   ] as const
@@ -688,28 +721,30 @@ export const CodegenView: React.FC<CodegenViewProps> = ({
                   <FileDown className="w-3 h-3" />
                   Export src/main.cpp
                 </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    handleCopy(
-                      'pio',
-                      pioTab === 'hardware_map' ? pioBundle.wiringMarkdown : activePioCode
-                    )
-                  }
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                >
-                  {copiedTarget === 'pio' ? (
-                    <>
-                      <Check className="w-3 h-3 text-emerald-400" />
-                      Copied
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-3 h-3" />
-                      {pioTab === 'hardware_map' ? 'Copy Wiring MD' : `Copy ${pioTab}`}
-                    </>
-                  )}
-                </button>
+                {pioTab !== 'build_flash' && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleCopy(
+                        'pio',
+                        pioTab === 'hardware_map' ? pioBundle.wiringMarkdown : activePioCode
+                      )
+                    }
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    {copiedTarget === 'pio' ? (
+                      <>
+                        <Check className="w-3 h-3 text-emerald-400" />
+                        Copied
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        {pioTab === 'hardware_map' ? 'Copy Wiring MD' : `Copy ${pioTab}`}
+                      </>
+                    )}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -724,6 +759,17 @@ export const CodegenView: React.FC<CodegenViewProps> = ({
                 onToggleSensor={handleToggleSensor}
                 onChangePin={handleChangePin}
                 onAutoMapPins={handleAutoMapSafePins}
+              />
+            ) : pioTab === 'build_flash' ? (
+              <Esp32FlashPanel
+                model={model}
+                boardEnv={pinProfile.boardEnv}
+                platformioIni={pioBundle.platformioIni}
+                mainCpp={pioBundle.mainCpp}
+                cHeader={bundle.cHeader}
+                cSource={bundle.cSource}
+                hilHeader={bundle.hilHeader}
+                esp32HilRxHeader={esp32HilRxHeader}
               />
             ) : (
               <pre className="flex-1 p-4 text-xs font-mono leading-5 text-slate-200 bg-[#07090E] overflow-auto">

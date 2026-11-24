@@ -1,15 +1,31 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Cable, Check, Copy, FileDown, Pause, Play, RefreshCw, StepForward } from 'lucide-react';
+import {
+  Activity,
+  Cable,
+  Check,
+  Copy,
+  FileDown,
+  Pause,
+  Play,
+  RefreshCw,
+  StepForward,
+  Usb,
+} from 'lucide-react';
 import { ControlModel, HilConfig, HilFramePacket, SimulationTrace } from '../types/control';
 import {
   buildHilFrameStream,
+  computeHilFrameCrc16,
   createHilPacket,
+  encodeHilWireFrameBytes,
+  evaluateHilLoopbackDiagnostic,
   generateEsp32HilDeserializationCpp,
+  HilLoopbackDiagnostic,
   isHilCobsEnabled,
 } from '../engine/hil';
 import { exportTextFile } from '../utils/exportBundle';
 import { HilLatencyChart } from './HilLatencyChart';
 import { HilSerialMonitorChart } from './HilSerialMonitorChart';
+import { HilWebSerialHandle, HilWebSerialPanel } from './HilWebSerialPanel';
 
 interface SerialPortInfo {
   id: string;
@@ -39,7 +55,9 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
   const [seed, setSeed] = useState(42);
   const [selectedSeq, setSelectedSeq] = useState<number>(1);
   const [isStreaming, setIsStreaming] = useState<boolean>(true);
-  const [bridgeMode, setBridgeMode] = useState<'simulated' | 'bridge'>('simulated');
+  const [bridgeMode, setBridgeMode] = useState<'simulated' | 'bridge' | 'webserial'>(
+    'simulated'
+  );
   const [serialPorts, setSerialPorts] = useState<SerialPortInfo[]>([
     {
       id: 'bridge://loopback-pty',
@@ -55,6 +73,12 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
   const [packets, setPackets] = useState<HilFramePacket[]>(() =>
     buildHilFrameStream(model, trace, { jitterMs: 1.2, packetDropPct: 4, seed: 42 }, 64)
   );
+  const [loopbackDiag, setLoopbackDiag] = useState<HilLoopbackDiagnostic | null>(null);
+  const [loopbackHistory, setLoopbackHistory] = useState<HilLoopbackDiagnostic[]>([]);
+  const [isVerifyingLoopback, setIsVerifyingLoopback] = useState(false);
+
+  const webSerialRef = useRef<HilWebSerialHandle | null>(null);
+  const diagIdRef = useRef<number>(1);
 
   const cobsActive = isHilCobsEnabled(model);
   const esp32RxCpp = useMemo(
@@ -195,8 +219,138 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
     }
   };
 
+  const recordLoopbackDiagnostic = (diag: HilLoopbackDiagnostic) => {
+    setLoopbackDiag(diag);
+    setLoopbackHistory((prev) => [diag, ...prev].slice(0, 5));
+  };
+
+  const handleVerifyLoopback = async () => {
+    const id = diagIdRef.current++;
+    setIsVerifyingLoopback(true);
+    try {
+      if (bridgeMode === 'webserial' && webSerialRef.current) {
+        const diag = await webSerialRef.current.runLoopbackDiagnostic(id);
+        recordLoopbackDiagnostic(diag);
+        return;
+      }
+
+      const budgetMs = model.baseDt * 1000;
+      const sample = trace.samples[trace.samples.length - 1] ?? {
+        t: 0,
+        ref: model.reference.finalValue,
+        silOutputs: [0, 0],
+        uSat: 0,
+      };
+      const nextSeq = seqRef.current + 1;
+      seqRef.current = nextSeq;
+      const fields = {
+        seq: nextSeq,
+        tickUs: Math.round(sample.t * 1_000_000) >>> 0,
+        ref: sample.ref,
+        y0: sample.silOutputs[0] ?? 0,
+        y1: sample.silOutputs[1] ?? 0,
+        uCmd: sample.uSat,
+      };
+      const expectedCrc16 = computeHilFrameCrc16(fields);
+      const wireBytes = encodeHilWireFrameBytes(model, fields);
+      const wireHex = Array.from(wireBytes)
+        .map((b) => b.toString(16).toUpperCase().padStart(2, '0'))
+        .join(' ');
+
+      const portTarget =
+        bridgeMode === 'bridge' ? selectedPortId : 'bridge://loopback-pty';
+      const targetLabel =
+        bridgeMode === 'bridge'
+          ? serialPorts.find((p) => p.id === selectedPortId)?.label ?? selectedPortId
+          : 'Host Bridge / Simulated Loopback';
+
+      const t0 = performance.now();
+      try {
+        const res = await fetch('/api/hil/probe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            portId: portTarget,
+            baudRate: 921600,
+            transport: model.hil.transport,
+            cobsEnabled: cobsActive,
+            wireHex,
+          }),
+        });
+        const data = (await res.json()) as {
+          ok: boolean;
+          rttMs?: number;
+          rxBytes?: number;
+          crcValid?: boolean;
+          decodedSeq?: number | null;
+          message?: string;
+          error?: string;
+        };
+        const measuredRtt =
+          typeof data.rttMs === 'number' ? data.rttMs : performance.now() - t0;
+
+        const diag = evaluateHilLoopbackDiagnostic({
+          id,
+          mode: bridgeMode === 'bridge' ? 'bridge' : 'simulated',
+          targetLabel,
+          cobsEnabled: cobsActive,
+          txSeq: nextSeq,
+          txBytes: wireBytes.byteLength,
+          expectedCrc16,
+          budgetMs,
+          rttMs: measuredRtt,
+          rxSeq: data.decodedSeq ?? (data.ok ? nextSeq : null),
+          rxBytes: data.rxBytes ?? 0,
+          rxCrc16: data.crcValid ? expectedCrc16 : null,
+          crcValid: Boolean(res.ok && data.ok && data.crcValid),
+          errorMessage: !res.ok
+            ? data.error ?? data.message ?? `HTTP ${res.status}`
+            : !data.ok
+            ? data.message ?? 'Bridge loopback probe failed'
+            : null,
+        });
+        if (bridgeMode === 'bridge' && data.message) {
+          setBridgeStatusMsg(data.message);
+        }
+        recordLoopbackDiagnostic(diag);
+      } catch {
+        // Offline / static fallback: run deterministic simulated round-trip packet check
+        const { packet } = createHilPacket(
+          model,
+          sample as SimulationTrace['samples'][number],
+          nextSeq,
+          0,
+          { jitterMs, packetDropPct, seed }
+        );
+        const diag = evaluateHilLoopbackDiagnostic({
+          id,
+          mode: 'simulated',
+          targetLabel: 'Simulated HIL Transport',
+          cobsEnabled: cobsActive,
+          txSeq: nextSeq,
+          txBytes: wireBytes.byteLength,
+          expectedCrc16: packet.crc16,
+          budgetMs,
+          rttMs: packet.rttMs,
+          rxPacket: packet.dropped ? null : packet,
+          rxBytes: packet.dropped ? 0 : packet.byteLength,
+          crcValid: !packet.dropped,
+        });
+        recordLoopbackDiagnostic(diag);
+      }
+    } finally {
+      setIsVerifyingLoopback(false);
+    }
+  };
+
+  const handleReceiveWebSerialPackets = (incoming: HilFramePacket[]) => {
+    if (incoming.length === 0) return;
+    setPackets((prev) => [...prev, ...incoming].slice(-96));
+    setSelectedSeq(incoming[incoming.length - 1].seq);
+  };
+
   useEffect(() => {
-    if (!isStreaming) return;
+    if (!isStreaming || bridgeMode === 'webserial') return;
     const timer = window.setInterval(() => {
       pushNextFrame();
     }, 220);
@@ -309,6 +463,16 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
             Re-seed Burst
           </button>
 
+          <button
+            type="button"
+            disabled={isVerifyingLoopback}
+            onClick={() => void handleVerifyLoopback()}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 border border-cyan-500/50 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
+          >
+            <Activity className={`w-3.5 h-3.5 text-cyan-300 ${isVerifyingLoopback ? 'animate-pulse' : ''}`} />
+            {isVerifyingLoopback ? 'Verifying...' : 'Verify Loopback'}
+          </button>
+
           <div className="flex items-center gap-1 p-0.5 bg-[#07090E] border border-slate-800 rounded">
             <button
               type="button"
@@ -330,7 +494,7 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
                 setBridgeMode('bridge');
                 void refreshBridgePorts();
               }}
-              className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
+              className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                 bridgeMode === 'bridge'
                   ? 'bg-slate-800 text-emerald-300'
                   : 'text-slate-400 hover:text-slate-200'
@@ -339,9 +503,145 @@ export const HilBridgeView: React.FC<HilBridgeViewProps> = ({
               <Cable className="w-3 h-3" />
               Local Node Bridge
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                setBridgeMode('webserial');
+                setBridgeStatusMsg(null);
+              }}
+              className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                bridgeMode === 'webserial'
+                  ? 'bg-slate-800 text-cyan-300'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Usb className="w-3 h-3" />
+              Web Serial (ESP32)
+            </button>
           </div>
         </div>
       </div>
+
+      {bridgeMode === 'webserial' && (
+        <HilWebSerialPanel
+          ref={webSerialRef}
+          model={model}
+          trace={trace}
+          onReceivePackets={handleReceiveWebSerialPackets}
+          onClearPackets={handleClearTelemetry}
+          onLoopbackResult={recordLoopbackDiagnostic}
+        />
+      )}
+
+      {loopbackDiag && (
+        <section
+          aria-label="HIL Loopback Integrity Diagnostic"
+          className="px-6 py-3.5 border-b border-slate-800 bg-[#0B0E17] space-y-2.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-3 text-xs font-mono">
+              <span
+                className={
+                  loopbackDiag.verdict === 'PASS'
+                    ? 'text-emerald-400 font-semibold'
+                    : loopbackDiag.verdict === 'WARN_LATENCY'
+                    ? 'text-amber-300 font-semibold'
+                    : 'text-rose-400 font-semibold'
+                }
+              >
+                {loopbackDiag.verdict === 'PASS'
+                  ? '● PASS · HIL Integrity Verified'
+                  : loopbackDiag.verdict === 'WARN_LATENCY'
+                  ? '▲ WARN · Latency Exceeds Budget'
+                  : '✖ FAIL · Loopback Integrity Failed'}
+              </span>
+              <span className="text-slate-400">{loopbackDiag.targetLabel}</span>
+              <span className="text-slate-500">· {loopbackDiag.protocol}</span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={isVerifyingLoopback}
+                onClick={() => void handleVerifyLoopback()}
+                className="px-2.5 py-1 text-[11px] font-mono rounded border border-slate-700 bg-[#07090E] hover:bg-slate-800 text-cyan-300 cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
+              >
+                Re-test
+              </button>
+              <button
+                type="button"
+                onClick={() => setLoopbackDiag(null)}
+                className="px-2 py-1 text-[11px] font-mono text-slate-400 hover:text-slate-200 cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs font-mono tabular-nums">
+            <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+              <div className="text-[10px] text-slate-500">Round-Trip Latency</div>
+              <div
+                className={`mt-0.5 font-semibold ${
+                  loopbackDiag.verdict === 'PASS'
+                    ? 'text-emerald-300'
+                    : loopbackDiag.verdict === 'WARN_LATENCY'
+                    ? 'text-amber-300'
+                    : 'text-rose-300'
+                }`}
+              >
+                {loopbackDiag.rttMs.toFixed(3)} ms
+              </div>
+            </div>
+
+            <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+              <div className="text-[10px] text-slate-500">Control Tick Budget</div>
+              <div className="mt-0.5 text-cyan-300">
+                {loopbackDiag.budgetMs.toFixed(2)} ms
+              </div>
+            </div>
+
+            <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+              <div className="text-[10px] text-slate-500">Sequence Echo</div>
+              <div className="mt-0.5 text-slate-200">
+                TX #{loopbackDiag.txSeq} →{' '}
+                {loopbackDiag.rxSeq !== null ? `RX #${loopbackDiag.rxSeq}` : 'No Reply'}
+              </div>
+            </div>
+
+            <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+              <div className="text-[10px] text-slate-500">CRC-16 Checksum</div>
+              <div
+                className={`mt-0.5 ${
+                  loopbackDiag.crcValid ? 'text-emerald-300' : 'text-rose-300'
+                }`}
+              >
+                0x{loopbackDiag.expectedCrc16.toString(16).toUpperCase().padStart(4, '0')}{' '}
+                {loopbackDiag.crcValid ? '(Valid)' : '(Invalid)'}
+              </div>
+            </div>
+
+            <div className="p-2.5 rounded border border-slate-800 bg-[#07090E]">
+              <div className="text-[10px] text-slate-500">Frame Bytes</div>
+              <div className="mt-0.5 text-slate-200">
+                {loopbackDiag.txBytes} B TX / {loopbackDiag.rxBytes} B RX
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 text-[11px] font-mono text-slate-400">
+            <span>{loopbackDiag.summary}</span>
+            {loopbackHistory.length > 1 && (
+              <span className="text-slate-500 tabular-nums">
+                Recent probes:{' '}
+                {loopbackHistory
+                  .map((h) => `#${h.txSeq} ${h.verdict} (${h.rttMs.toFixed(2)}ms)`)
+                  .join(' · ')}
+              </span>
+            )}
+          </div>
+        </section>
+      )}
 
       {bridgeMode === 'bridge' && (
         <div className="px-6 py-2.5 border-b border-slate-800 bg-[#0B0E17] flex flex-wrap items-center justify-between gap-4 text-xs">

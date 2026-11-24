@@ -3,10 +3,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SerialPort } from 'serialport';
 import {
+  buildEsp32Firmware,
+  flashEsp32ViaPlatformIo,
   getBridgeStatus,
+  getEsp32ToolchainStatus,
   listSerialPorts,
   probeHilBridge,
   verifyEmbeddedBuild,
+  type Esp32BuildRequest,
+  type Esp32FlashRequest,
   type FirmwareVerifyRequest,
   type HilProbeRequest,
 } from './bridgeService.ts';
@@ -20,7 +25,7 @@ export function createBridgeRouter(options: BridgeRouterOptions = {}): Router {
   const router = express.Router();
   const allowedOriginSet = new Set(options.allowedOrigins ?? []);
 
-  router.use(express.json({ limit: '512kb' }));
+  router.use(express.json({ limit: '1mb' }));
 
   router.use((req: Request, res: Response, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -143,6 +148,75 @@ export function createBridgeRouter(options: BridgeRouterOptions = {}): Router {
       res.status(400).json({
         ok: false,
         error: err instanceof Error ? err.message : 'HIL probe rejected.',
+      });
+    }
+  });
+
+  router.get('/esp32/status', async (_req: Request, res: Response) => {
+    try {
+      const status = await getEsp32ToolchainStatus();
+      res.json(status);
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed to inspect ESP32 toolchain.',
+      });
+    }
+  });
+
+  router.post('/esp32/build', async (req: Request, res: Response) => {
+    try {
+      const body = req.body as Partial<Esp32BuildRequest>;
+      if (
+        !body ||
+        typeof body.boardEnv !== 'string' ||
+        typeof body.platformioIni !== 'string' ||
+        typeof body.mainCpp !== 'string' ||
+        typeof body.cHeader !== 'string' ||
+        typeof body.cSource !== 'string' ||
+        typeof body.hilHeader !== 'string'
+      ) {
+        res.status(400).json({
+          ok: false,
+          error: 'Expected boardEnv, platformioIni, mainCpp, cHeader, cSource, and hilHeader.',
+        });
+        return;
+      }
+      const result = await buildEsp32Firmware(body as Esp32BuildRequest);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'ESP32 firmware build failed.',
+      });
+    }
+  });
+
+  router.post('/esp32/flash', async (req: Request, res: Response) => {
+    try {
+      const body = req.body as Partial<Esp32FlashRequest>;
+      if (
+        !body ||
+        typeof body.portId !== 'string' ||
+        typeof body.boardEnv !== 'string' ||
+        typeof body.platformioIni !== 'string' ||
+        typeof body.mainCpp !== 'string' ||
+        typeof body.cHeader !== 'string' ||
+        typeof body.cSource !== 'string' ||
+        typeof body.hilHeader !== 'string'
+      ) {
+        res.status(400).json({
+          ok: false,
+          error: 'Expected portId, boardEnv, and PlatformIO project sources.',
+        });
+        return;
+      }
+      const result = await flashEsp32ViaPlatformIo(body as Esp32FlashRequest);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'ESP32 USB flash failed.',
       });
     }
   });

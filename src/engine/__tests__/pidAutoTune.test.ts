@@ -76,4 +76,24 @@ describe('ESP32 PID Auto-Tuner (rise time & overshoot constraints)', () => {
     expect(pendRes.closedLoopVerdict).toBe('STABLE');
     expect(Number.isFinite(pendRes.recommendedPid.kp)).toBe(true);
   });
+
+  it('minimizes unit-step settling time for ESP32+Ultrasonic plant model under overshoot constraints', () => {
+    const usModel = getPlantTemplateById('esp32_ultrasonic_hold')!.model;
+
+    const result = autoTunePidGains(usModel, {
+      targetRiseTimeSec: 0.35,
+      maxOvershootPct: 8,
+      maxSettlingTimeSec: 0.85,
+      objective: 'min_settling_time',
+      esp32Board: 'esp32dev',
+    });
+
+    expect(result.objective).toBe('min_settling_time');
+    expect(result.targetModelId).toBe('esp32_ultrasonic_hold');
+    expect(result.closedLoopVerdict).toBe('STABLE');
+    expect(result.achievedSettlingTimeSec).not.toBeNull();
+    expect(result.baselineSettlingTimeSec).not.toBeNull();
+    expect(result.achievedSettlingTimeSec!).toBeLessThanOrEqual(result.baselineSettlingTimeSec!);
+    expect(result.achievedOvershootPct!).toBeLessThanOrEqual(9);
+  });
 });

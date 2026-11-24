@@ -602,3 +602,333 @@ export async function probeHilBridge(req: HilProbeRequest): Promise<HilProbeResp
   };
 }
 
+export type AllowedEsp32BoardEnv =
+  | 'esp32dev'
+  | 'esp32-s3-devkitc-1'
+  | 'esp32-c3-devkitm-1';
+
+export interface Esp32ToolchainStatus {
+  ok: boolean;
+  pioAvailable: boolean;
+  pioBinary: string | null;
+  pioVersion: string | null;
+  esptoolAvailable: boolean;
+  ports: SerialPortInfo[];
+}
+
+export interface Esp32BuildRequest {
+  boardEnv: AllowedEsp32BoardEnv;
+  platformioIni: string;
+  mainCpp: string;
+  cHeader: string;
+  cSource: string;
+  hilHeader: string;
+  esp32HilRxHeader?: string;
+}
+
+export interface Esp32FirmwareImage {
+  name: string;
+  address: number;
+  sizeBytes: number;
+  base64: string;
+}
+
+export interface Esp32BuildResponse {
+  ok: boolean;
+  boardEnv: AllowedEsp32BoardEnv;
+  compiledAt: string;
+  durationMs: number;
+  pioCommand: string;
+  firmwareBytes: number | null;
+  images: Esp32FirmwareImage[];
+  logs: string;
+  message: string;
+}
+
+export interface Esp32FlashRequest extends Esp32BuildRequest {
+  portId: string;
+}
+
+export interface Esp32FlashResponse {
+  ok: boolean;
+  boardEnv: AllowedEsp32BoardEnv;
+  portId: string;
+  durationMs: number;
+  command: string;
+  logs: string;
+  message: string;
+}
+
+const ALLOWED_ESP32_ENVS = new Set<AllowedEsp32BoardEnv>([
+  'esp32dev',
+  'esp32-s3-devkitc-1',
+  'esp32-c3-devkitm-1',
+]);
+
+async function resolvePlatformIoBinary(): Promise<string | null> {
+  const pathBin = await findExecutable(['pio', 'platformio']);
+  if (pathBin) return pathBin;
+
+  const homePioCandidates = [
+    path.join(os.homedir(), '.platformio', 'penv', 'bin', 'pio'),
+    path.join(os.homedir(), '.local', 'bin', 'pio'),
+  ];
+  for (const candidate of homePioCandidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // Ignore permission errors
+    }
+  }
+  return null;
+}
+
+export async function getEsp32ToolchainStatus(): Promise<Esp32ToolchainStatus> {
+  const [pioBinary, esptoolBinary, ports] = await Promise.all([
+    resolvePlatformIoBinary(),
+    findExecutable(['esptool.py', 'esptool']),
+    listSerialPorts(),
+  ]);
+
+  let pioVersion: string | null = null;
+  if (pioBinary) {
+    try {
+      const { stdout } = await execFileAsync(pioBinary, ['--version'], {
+        timeout: 3000,
+      });
+      pioVersion = stdout.trim() || null;
+    } catch {
+      pioVersion = null;
+    }
+  }
+
+  return {
+    ok: true,
+    pioAvailable: Boolean(pioBinary),
+    pioBinary,
+    pioVersion,
+    esptoolAvailable: Boolean(esptoolBinary),
+    ports,
+  };
+}
+
+function validateEsp32BuildPayload(req: Esp32BuildRequest): void {
+  if (!ALLOWED_ESP32_ENVS.has(req.boardEnv)) {
+    throw new Error(`Unsupported ESP32 PlatformIO environment: ${req.boardEnv}`);
+  }
+  const requiredFields = [
+    req.platformioIni,
+    req.mainCpp,
+    req.cHeader,
+    req.cSource,
+    req.hilHeader,
+  ];
+  if (req.esp32HilRxHeader !== undefined) {
+    requiredFields.push(req.esp32HilRxHeader);
+  }
+  for (const field of requiredFields) {
+    if (
+      typeof field !== 'string' ||
+      field.length === 0 ||
+      field.length > MAX_SOURCE_CHARS ||
+      field.includes('\0')
+    ) {
+      throw new Error('ESP32 firmware source payload invalid or exceeds size limit.');
+    }
+  }
+}
+
+function stageEsp32PlatformIoWorkspace(tmpDir: string, req: Esp32BuildRequest): void {
+  fs.mkdirSync(resolveConfinedPath(tmpDir, 'include'), { recursive: true });
+  fs.mkdirSync(resolveConfinedPath(tmpDir, 'src'), { recursive: true });
+
+  fs.writeFileSync(resolveConfinedPath(tmpDir, 'platformio.ini'), req.platformioIni, 'utf8');
+  fs.writeFileSync(
+    resolveConfinedPath(tmpDir, path.join('include', 'ctrl_model.h')),
+    req.cHeader,
+    'utf8'
+  );
+  fs.writeFileSync(
+    resolveConfinedPath(tmpDir, path.join('include', 'hil_frame.h')),
+    req.hilHeader,
+    'utf8'
+  );
+  if (req.esp32HilRxHeader) {
+    fs.writeFileSync(
+      resolveConfinedPath(tmpDir, path.join('include', 'esp32_hil_rx.hpp')),
+      req.esp32HilRxHeader,
+      'utf8'
+    );
+  }
+  fs.writeFileSync(
+    resolveConfinedPath(tmpDir, path.join('src', 'ctrl_model.c')),
+    req.cSource,
+    'utf8'
+  );
+  fs.writeFileSync(
+    resolveConfinedPath(tmpDir, path.join('src', 'main.cpp')),
+    req.mainCpp,
+    'utf8'
+  );
+}
+
+export async function buildEsp32Firmware(
+  req: Esp32BuildRequest
+): Promise<Esp32BuildResponse> {
+  validateEsp32BuildPayload(req);
+  const pioBin = await resolvePlatformIoBinary();
+  const cmdStr = `pio run -e ${req.boardEnv}`;
+
+  if (!pioBin) {
+    return {
+      ok: false,
+      boardEnv: req.boardEnv,
+      compiledAt: new Date().toISOString(),
+      durationMs: 0,
+      pioCommand: cmdStr,
+      firmwareBytes: null,
+      images: [],
+      logs:
+        'PlatformIO CLI (`pio`) not detected on host PATH or ~/.platformio/penv/bin/pio.\n' +
+        'Install PlatformIO Core locally (`pipx install platformio` or VS Code PlatformIO IDE), OR upload an existing compiled `.bin` directly in the Web Serial Flasher below.',
+      message: 'PlatformIO CLI (pio) not installed on this host.',
+    };
+  }
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openloop-pio-'));
+  const start = performance.now();
+
+  try {
+    stageEsp32PlatformIoWorkspace(tmpDir, req);
+
+    const { stdout, stderr } = await execFileAsync(
+      pioBin,
+      ['run', '-e', req.boardEnv],
+      {
+        cwd: tmpDir,
+        timeout: 120_000,
+        maxBuffer: 2 * 1024 * 1024,
+      }
+    );
+
+    const buildOutDir = resolveConfinedPath(
+      tmpDir,
+      path.join('.pio', 'build', req.boardEnv)
+    );
+    const bootloaderOffset = req.boardEnv === 'esp32dev' ? 0x1000 : 0x0;
+    const candidateFiles: Array<{ file: string; address: number }> = [
+      { file: 'bootloader.bin', address: bootloaderOffset },
+      { file: 'partitions.bin', address: 0x8000 },
+      { file: 'firmware.bin', address: 0x10000 },
+    ];
+
+    const images: Esp32FirmwareImage[] = [];
+    for (const entry of candidateFiles) {
+      const binPath = path.resolve(buildOutDir, entry.file);
+      if (binPath.startsWith(buildOutDir + path.sep) && fs.existsSync(binPath)) {
+        const buf = fs.readFileSync(binPath);
+        images.push({
+          name: entry.file,
+          address: entry.address,
+          sizeBytes: buf.byteLength,
+          base64: buf.toString('base64'),
+        });
+      }
+    }
+
+    const appImage = images.find((img) => img.name === 'firmware.bin');
+    return {
+      ok: Boolean(appImage),
+      boardEnv: req.boardEnv,
+      compiledAt: new Date().toISOString(),
+      durationMs: Number((performance.now() - start).toFixed(1)),
+      pioCommand: cmdStr,
+      firmwareBytes: appImage?.sizeBytes ?? null,
+      images,
+      logs: [stdout, stderr].filter(Boolean).join('\n').trim() || 'PlatformIO build succeeded.',
+      message: appImage
+        ? `Compiled ${req.boardEnv} firmware.bin (${appImage.sizeBytes} bytes) ready for USB / Web Serial flashing.`
+        : 'PlatformIO build finished but firmware.bin was not produced.',
+    };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; message?: string };
+    return {
+      ok: false,
+      boardEnv: req.boardEnv,
+      compiledAt: new Date().toISOString(),
+      durationMs: Number((performance.now() - start).toFixed(1)),
+      pioCommand: cmdStr,
+      firmwareBytes: null,
+      images: [],
+      logs: [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim(),
+      message: `PlatformIO compile failed for ${req.boardEnv}.`,
+    };
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+export async function flashEsp32ViaPlatformIo(
+  req: Esp32FlashRequest
+): Promise<Esp32FlashResponse> {
+  validateEsp32BuildPayload(req);
+  const allowedPorts = await listSerialPorts();
+  const matchedPort = allowedPorts.find(
+    (p) => p.id === req.portId && p.kind === 'hardware'
+  );
+  if (!matchedPort) {
+    throw new Error('Selected serial port is not an enumerated hardware USB port.');
+  }
+
+  const pioBin = await resolvePlatformIoBinary();
+  const cmdStr = `pio run -e ${req.boardEnv} -t upload --upload-port ${matchedPort.id}`;
+  if (!pioBin) {
+    return {
+      ok: false,
+      boardEnv: req.boardEnv,
+      portId: matchedPort.id,
+      durationMs: 0,
+      command: cmdStr,
+      logs: 'PlatformIO CLI (`pio`) not detected on host.',
+      message: 'PlatformIO CLI is required for direct host upload.',
+    };
+  }
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openloop-pio-upload-'));
+  const start = performance.now();
+  try {
+    stageEsp32PlatformIoWorkspace(tmpDir, req);
+    const { stdout, stderr } = await execFileAsync(
+      pioBin,
+      ['run', '-e', req.boardEnv, '-t', 'upload', '--upload-port', matchedPort.id],
+      {
+        cwd: tmpDir,
+        timeout: 150_000,
+        maxBuffer: 2 * 1024 * 1024,
+      }
+    );
+    return {
+      ok: true,
+      boardEnv: req.boardEnv,
+      portId: matchedPort.id,
+      durationMs: Number((performance.now() - start).toFixed(1)),
+      command: cmdStr,
+      logs: [stdout, stderr].filter(Boolean).join('\n').trim() || 'Upload completed.',
+      message: `Flashed ${req.boardEnv} onto ${matchedPort.id} via PlatformIO CLI.`,
+    };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; message?: string };
+    return {
+      ok: false,
+      boardEnv: req.boardEnv,
+      portId: matchedPort.id,
+      durationMs: Number((performance.now() - start).toFixed(1)),
+      command: cmdStr,
+      logs: [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim(),
+      message: `PlatformIO upload failed on ${matchedPort.id}.`,
+    };
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
